@@ -1,0 +1,6 @@
+Name,Serial,Model,IP,Status,SDM Status,SDM Port,MAC Address
+NoPort,SN1,WAX610,10.0.0.1,Online,Disabled,,AA-BB-CC-DD-EE-01
+BadPort,SN2,WAX610,10.0.0.2,Online,Disabled,abc,AA-BB-CC-DD-EE-02
+EnabledWithPort,SN3,WAX615,10.0.0.3,Online,Enabled,65279,AA-BB-CC-DD-EE-03
+DisabledButPort,SN4,WAX615,10.0.0.4,Online,Disabled,60799,AA-BB-CC-DD-EE-04
+TooBig,SN5,WAX610,10.0.0.5,Online,Enabled,999999,AA-BB-CC-DD-EE-05

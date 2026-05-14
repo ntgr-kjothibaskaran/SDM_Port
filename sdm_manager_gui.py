@@ -1,30 +1,114 @@
 #!/usr/bin/env python3
 import asyncio
+import csv
 import json
 import logging
-import time
-import tkinter as tk
-from datetime import datetime
-from tkinter import ttk, messagebox, scrolledtext
-from typing import Dict, List, Optional
+import os
+import posixpath
+import re
+import shlex
+import ssl
+import sys
+import tempfile
 import threading
+from pathlib import Path
+
+try:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, scrolledtext, ttk
+except ImportError as e:
+    msg = str(e).lower()
+    if "_tkinter" in msg or "tkinter" in msg:
+        print(
+            "\nThis GUI needs Tcl/Tk. The Python you are using was built without _tkinter.\n\n"
+            "On macOS with Homebrew Python 3.14, install the matching Tk bindings:\n"
+            "  brew install python-tk@3.14\n\n"
+            "Or run with Apple’s system Python (usually has Tk):\n"
+            f"  /usr/bin/python3 {Path(__file__).resolve()}\n\n"
+            "If the GUI then aborts with “macOS 26 … required, have instead 16 …”, do not use\n"
+            "/usr/bin/python3 — use Homebrew python+python-tk or the installer from python.org.\n"
+            "On macOS you can run:  ./run_sdm_gui_macos.sh\n",
+            file=sys.stderr,
+        )
+    raise
+from dataclasses import replace
+from datetime import datetime
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 try:
     import aiohttp
     import requests
     import jwt
+    import certifi
     from datetime import datetime
 except ImportError:
     print("Installing required dependencies...")
     import subprocess
     import sys
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "aiohttp", "requests", "PyJWT"])
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "aiohttp", "requests", "PyJWT", "certifi"])
     import aiohttp
     import requests
     import jwt
+    import certifi
     from datetime import datetime
 
 print("SDM Manager: Authentication ready.")
+
+# Verify SSL configuration on startup
+try:
+    import certifi
+    cert_path = certifi.where()
+    print(f"✅ SSL certificates loaded from: {cert_path}")
+except Exception as e:
+    print(f"⚠️ Warning: SSL certificate issue: {e}")
+    print("   This may cause SSL verification errors on macOS")
+
+# SSL Configuration Utilities
+def get_ssl_context():
+    """Create SSL context with proper certificate verification for macOS compatibility."""
+    try:
+        # Create SSL context with certificate verification
+        ssl_context = ssl.create_default_context(cafile=certifi.where())
+        print(f"SSL context created with certificate bundle: {certifi.where()}")
+        return ssl_context
+    except Exception as e:
+        print(f"Warning: Could not create SSL context with certifi: {e}")
+        try:
+            # Fallback to default SSL context
+            ssl_context = ssl.create_default_context()
+            print("Using default SSL context")
+            return ssl_context
+        except Exception as e2:
+            print(f"Warning: Could not create default SSL context: {e2}")
+            return None
+
+def get_ssl_context_no_verify():
+    """Create SSL context without verification (for debugging only)."""
+    try:
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+        print("⚠️ Created SSL context without verification (INSECURE - for debugging only)")
+        return ssl_context
+    except Exception as e:
+        print(f"Error creating no-verify SSL context: {e}")
+        return None
+
+def get_requests_verify_config(config=None):
+    """Get SSL verification configuration for requests library."""
+    if config and not config.SSL_VERIFY:
+        print("⚠️ SSL verification disabled for requests (INSECURE)")
+        return False
+        
+    try:
+        # Use certifi certificate bundle
+        cert_bundle = certifi.where()
+        print(f"Using certificate bundle for requests: {cert_bundle}")
+        return cert_bundle
+    except Exception as e:
+        print(f"Warning: Could not get certifi bundle: {e}")
+        # Fallback to True (use default certificates)
+        return True
 
 # Configuration for Multiple Environments
 class Config:
@@ -94,6 +178,9 @@ class Config:
     SDM_ENABLE_TIMEOUT = 180
     SDM_CHECK_INTERVAL = 10
     MAX_RETRIES = 3
+    
+    # SSL Configuration - set to False only for debugging SSL issues
+    SSL_VERIFY = True  # Set to False to disable SSL verification (NOT recommended for production)
     
     def __init__(self, environment="pri-qa"):
         self.set_environment(environment)
@@ -226,7 +313,8 @@ class AuthService:
                 f"{self.config.API_BASE_URL}public/v1/swagger/authenticate",
                 json=auth_data,
                 headers=headers,
-                timeout=self.config.REQUEST_TIMEOUT
+                timeout=self.config.REQUEST_TIMEOUT,
+                verify=get_requests_verify_config(self.config)
             )
             
             print(f"Swagger authenticate status: {response.status_code}")
@@ -306,7 +394,17 @@ class AuthService:
                 return None
                     
         except Exception as e:
-            print(f"Swagger authenticate exception: {str(e)}")
+            error_msg = str(e)
+            print(f"Swagger authenticate exception: {error_msg}")
+            
+            # Provide helpful SSL error guidance
+            if "SSL" in error_msg or "certificate" in error_msg.lower():
+                print("SSL Certificate Error Detected!")
+                print("This is common on macOS. The SSL configuration has been updated to help resolve this.")
+                print("If this persists, you can:")
+                print("1. Try: pip install --upgrade certifi")
+                print("2. Use Manual Credentials authentication instead")
+                
             return None
     
 
@@ -319,10 +417,44 @@ class InsightCloudAPI:
     def __init__(self, config=None):
         self.config = config or Config()
         self.session = None
+        
+        # Verify SSL setup on initialization
+        try:
+            ssl_context = get_ssl_context()
+            if ssl_context:
+                print("✅ SSL context verification successful for API client")
+            else:
+                print("⚠️ Warning: SSL context could not be created")
+        except Exception as e:
+            print(f"⚠️ SSL setup warning: {e}")
 
     async def __aenter__(self):
         timeout = aiohttp.ClientTimeout(total=self.config.REQUEST_TIMEOUT)
-        self.session = aiohttp.ClientSession(timeout=timeout)
+        
+        # Create SSL context based on configuration
+        if self.config.SSL_VERIFY:
+            ssl_context = get_ssl_context()
+            if ssl_context:
+                connector = aiohttp.TCPConnector(ssl=ssl_context)
+                print("Using SSL-verified aiohttp connector")
+            else:
+                # If we can't create SSL context but verification is enabled, try default
+                connector = aiohttp.TCPConnector()
+                print("Warning: Using default aiohttp connector")
+        else:
+            # SSL verification disabled (for debugging)
+            ssl_context = get_ssl_context_no_verify()
+            if ssl_context:
+                connector = aiohttp.TCPConnector(ssl=ssl_context)
+                print("⚠️ Using aiohttp connector WITHOUT SSL verification (INSECURE)")
+            else:
+                connector = aiohttp.TCPConnector(ssl=False)
+                print("⚠️ Using aiohttp connector with SSL disabled (INSECURE)")
+        
+        self.session = aiohttp.ClientSession(
+            timeout=timeout,
+            connector=connector
+        )
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
@@ -386,8 +518,18 @@ class InsightCloudAPI:
                             raise Exception(f"API error ({response.status}): {result.get('message', 'Unknown error')}")
                         
             except Exception as e:
-                print(f"Request attempt {attempt + 1} failed: {str(e)}")
+                error_msg = str(e)
+                print(f"Request attempt {attempt + 1} failed: {error_msg}")
+                
+                # Provide helpful SSL error guidance for async requests
+                if "SSL" in error_msg or "certificate" in error_msg.lower():
+                    print(f"SSL Error in async request to {url}")
+                    print("The SSL configuration has been updated to handle certificate verification.")
+                
                 if attempt == self.config.MAX_RETRIES - 1:
+                    # Add more context to SSL errors before raising
+                    if "SSL" in error_msg or "certificate" in error_msg.lower():
+                        raise Exception(f"SSL Certificate Error: {error_msg}. This has been configured to work with macOS certificate stores.")
                     raise e
                 await asyncio.sleep(2 ** attempt)
 
@@ -653,6 +795,7 @@ class SDMManagerGUI:
         
         # Setup UI
         self.setup_ui()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_app_window_close)
         
     def setup_styles(self):
         """Configure modern styling and themes."""
@@ -727,7 +870,10 @@ class SDMManagerGUI:
         
         # Management tab
         self.setup_management_tab()
-        
+
+        # File transfer (SSH / sshcommand)
+        self.setup_file_transfer_tab()
+
         # Log tab
         self.setup_log_tab()
         
@@ -1146,6 +1292,21 @@ class SDMManagerGUI:
         self.log_text.pack(fill=tk.BOTH, expand=True, padx=20, pady=(0, 20))
         
         self.log("SDM Manager initialized. Please authenticate to continue.")
+        
+        # Log SSL configuration status
+        try:
+            if self.config.SSL_VERIFY:
+                cert_bundle = get_requests_verify_config(self.config)
+                if isinstance(cert_bundle, str):
+                    self.log(f"✅ SSL certificates configured: {cert_bundle}")
+                elif cert_bundle is True:
+                    self.log("✅ SSL certificates configured: Using system defaults")
+                else:
+                    self.log("⚠️ SSL verification disabled")
+            else:
+                self.log("⚠️ WARNING: SSL verification is DISABLED (insecure mode)")
+        except Exception as e:
+            self.log(f"⚠️ SSL configuration warning: {e}")
         
     def clear_logs(self):
         """Clear all log messages."""
@@ -2207,6 +2368,1288 @@ Current Environment: {self.config.ENVIRONMENT_NAME}"""
                 values[6] = "🟢 Enabled" if new_status == "1" else "🔴 Disabled"  # SDM Status column (now index 6)
                 self.device_tree.item(item_id, values=values)
                 break
+
+    def _ft_import_sshcommand(self):
+        """Load sshCommander/sshcommand.py as ``sshcommand``."""
+        root = Path(__file__).resolve().parent / "sshCommander"
+        p = str(root)
+        if p not in sys.path:
+            sys.path.insert(0, p)
+        import sshcommand  # noqa: PLC0415
+
+        return sshcommand
+
+    def setup_file_transfer_tab(self):
+        """Tab: CSV AP pick, batch or single-AP explorer upload/download via sshcommand."""
+        tab = ttk.Frame(self.notebook)
+        self.notebook.add(tab, text="📁 File transfer")
+
+        self.ft_csv_path: Optional[Path] = None
+        self.ft_csv_fieldnames: List[str] = []
+        self.ft_inventory: List[Dict[str, Any]] = []
+        self.ft_batch_upload_paths: List[Path] = []
+        self.ft_local_cwd = Path.home().resolve()
+        self.ft_busy = False
+        self.ft_action_widgets: List[tk.Widget] = []
+
+        ft_canvas = tk.Canvas(tab, highlightthickness=0)
+        ft_scroll = ttk.Scrollbar(tab, orient=tk.VERTICAL, command=ft_canvas.yview)
+        ft_inner = ttk.Frame(ft_canvas)
+        ft_win = ft_canvas.create_window((0, 0), window=ft_inner, anchor="nw")
+
+        def _ft_inner_configure(_: tk.Event) -> None:
+            ft_canvas.configure(scrollregion=ft_canvas.bbox("all"))
+
+        def _ft_canvas_configure(e: tk.Event) -> None:
+            ft_canvas.itemconfigure(ft_win, width=e.width)
+
+        ft_inner.bind("<Configure>", _ft_inner_configure)
+        ft_canvas.bind("<Configure>", _ft_canvas_configure)
+        ft_canvas.configure(yscrollcommand=ft_scroll.set)
+        ft_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        ft_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        def _ft_canvas_mousewheel(event: tk.Event) -> Optional[str]:
+            if getattr(event, "delta", 0):
+                ft_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            elif getattr(event, "num", 0) == 4:
+                ft_canvas.yview_scroll(-3, "units")
+            elif getattr(event, "num", 0) == 5:
+                ft_canvas.yview_scroll(3, "units")
+            return "break"
+
+        ft_canvas.bind("<MouseWheel>", _ft_canvas_mousewheel)
+        ft_canvas.bind("<Button-4>", _ft_canvas_mousewheel)
+        ft_canvas.bind("<Button-5>", _ft_canvas_mousewheel)
+        ft_inner.bind("<MouseWheel>", _ft_canvas_mousewheel)
+        ft_inner.bind("<Button-4>", _ft_canvas_mousewheel)
+        ft_inner.bind("<Button-5>", _ft_canvas_mousewheel)
+
+        self.ft_tab_canvas = ft_canvas
+
+        outer = ttk.PanedWindow(ft_inner, orient=tk.HORIZONTAL)
+        outer.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        left = ttk.Frame(outer)
+        right = ttk.LabelFrame(outer, text=" Summary ", padding=12)
+        outer.add(left, weight=4)
+        outer.add(right, weight=1)
+
+        left_v = ttk.PanedWindow(left, orient=tk.VERTICAL)
+        left_v.pack(fill=tk.BOTH, expand=True)
+        top_area = ttk.Frame(left_v)
+        mid_log = ttk.PanedWindow(left_v, orient=tk.VERTICAL)
+        left_v.add(top_area, weight=2)
+        left_v.add(mid_log, weight=3)
+
+        jump = ttk.LabelFrame(top_area, text=" Jump host (SMB Shells) ", padding=10)
+        jump.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(
+            jump,
+            text="Uses sshcommand with --require-sdm-enabled and --accept-new-host-key (always on).",
+            wraplength=720,
+        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
+
+        self.ft_url_var = tk.StringVar()
+        self.ft_rsa_var = tk.StringVar()
+        self.ft_ssh_port_var = tk.StringVar(value="443")
+        ttk.Label(jump, text="SSH URL (user@host):").grid(row=1, column=0, sticky="w", pady=2)
+        ttk.Entry(jump, textvariable=self.ft_url_var, width=48).grid(row=1, column=1, sticky="ew", padx=6)
+        ttk.Label(jump, text="SSH key (-i):").grid(row=2, column=0, sticky="w", pady=2)
+        ttk.Entry(jump, textvariable=self.ft_rsa_var, width=48).grid(row=2, column=1, sticky="ew", padx=6)
+        ttk.Button(jump, text="Browse…", command=self._ft_browse_rsa).grid(row=2, column=2, padx=4)
+        ttk.Label(jump, text="Jump SSH port:").grid(row=3, column=0, sticky="w", pady=2)
+        ttk.Entry(jump, textvariable=self.ft_ssh_port_var, width=8).grid(row=3, column=1, sticky="w", padx=6)
+        jump.columnconfigure(1, weight=1)
+
+        csv_frame = ttk.LabelFrame(top_area, text=" 1. Inventory CSV ", padding=10)
+        csv_frame.pack(fill=tk.X, pady=(0, 8))
+        self.ft_csv_label_var = tk.StringVar(value="No CSV loaded")
+        ttk.Button(csv_frame, text="Browse CSV…", command=self._ft_browse_csv).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(csv_frame, textvariable=self.ft_csv_label_var, wraplength=600).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Label(
+            csv_frame,
+            text="Requires columns Name and SDM Port (Insight export). Only SDM Status=Enabled rows can be selected.",
+            wraplength=720,
+            foreground="#555",
+        ).pack(fill=tk.X, pady=(8, 0))
+
+        ap_frame = ttk.LabelFrame(top_area, text=" 2. Select APs ", padding=10)
+        ap_frame.pack(fill=tk.BOTH, expand=False, pady=(0, 8))
+        tb = ttk.Frame(ap_frame)
+        tb.pack(fill=tk.X, pady=(0, 6))
+        ttk.Button(tb, text="Select all (eligible)", command=self._ft_check_all).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(tb, text="Clear selection", command=self._ft_check_none).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(tb, text="Connect", command=self._ft_connect_clicked).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(tb, text="Disconnect", command=self._ft_disconnect_all).pack(side=tk.LEFT)
+        self.ft_sel_count_var = tk.StringVar(value="Selected eligible APs: 0")
+        ttk.Label(tb, textvariable=self.ft_sel_count_var).pack(side=tk.RIGHT)
+
+        tree_wrap = ttk.Frame(ap_frame)
+        tree_wrap.pack(fill=tk.BOTH, expand=True)
+        cols = ("Select", "Name", "IP", "Model", "SDM Status", "SDM Port", "Connection")
+        self.ft_tree = ttk.Treeview(tree_wrap, columns=cols, show="headings", height=6, selectmode="browse")
+        for c, w in zip(cols, (50, 160, 110, 90, 90, 80, 100)):
+            self.ft_tree.heading(c, text=c)
+            self.ft_tree.column(
+                c,
+                width=w,
+                anchor=tk.CENTER if c in ("Select", "SDM Port", "Connection") else tk.W,
+            )
+        vsb = ttk.Scrollbar(tree_wrap, orient=tk.VERTICAL, command=self.ft_tree.yview)
+        self.ft_tree.configure(yscrollcommand=vsb.set)
+        self.ft_tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        tree_wrap.grid_rowconfigure(0, weight=1)
+        tree_wrap.grid_columnconfigure(0, weight=1)
+        self.ft_tree.bind("<Double-1>", self._ft_toggle_row)
+        self.ft_tree.bind("<<TreeviewSelect>>", lambda e: self._ft_on_tree_select())
+
+        mode_fr = ttk.LabelFrame(top_area, text=" 3. Transfer mode ", padding=10)
+        mode_fr.pack(fill=tk.X, pady=(0, 8))
+        mode_row = ttk.Frame(mode_fr)
+        mode_row.pack(fill=tk.X)
+        self.ft_mode_var = tk.StringVar(value="upload")
+        ttk.Radiobutton(mode_row, text="Upload", variable=self.ft_mode_var, value="upload", command=self._ft_on_mode_change).pack(side=tk.LEFT, padx=(0, 16))
+        ttk.Radiobutton(mode_row, text="Download", variable=self.ft_mode_var, value="download", command=self._ft_on_mode_change).pack(side=tk.LEFT)
+        to_row = ttk.Frame(mode_fr)
+        to_row.pack(fill=tk.X, pady=(8, 0))
+        ttk.Label(to_row, text="Download timeout (sec, base64 wait per file):").pack(side=tk.LEFT)
+        self.ft_download_timeout_var = tk.StringVar(value="900")
+        ttk.Entry(to_row, textvariable=self.ft_download_timeout_var, width=10).pack(side=tk.LEFT, padx=6)
+
+        ft_mid = ttk.Frame(mid_log)
+        mid_log.add(ft_mid, weight=4)
+        self.ft_body = ttk.Frame(ft_mid)
+        self.ft_body.pack(fill=tk.BOTH, expand=True)
+
+        self.ft_batch_frame = ttk.LabelFrame(self.ft_body, text=" Batch (multiple APs) ", padding=10)
+        self.ft_batch_frame.pack(fill=tk.BOTH, expand=True)
+
+        self.ft_batch_row1 = ttk.Frame(self.ft_batch_frame)
+        self.ft_batch_row1.pack(fill=tk.X, pady=4)
+        self.ft_batch_path_label = ttk.Label(self.ft_batch_row1, text="Destination on APs:")
+        self.ft_batch_path_label.pack(anchor=tk.W)
+        self.ft_batch_ap_path_var = tk.StringVar()
+        self.ft_batch_path_entry = ttk.Entry(self.ft_batch_row1, textvariable=self.ft_batch_ap_path_var, width=70)
+        self.ft_batch_path_entry.pack(fill=tk.X, pady=2)
+
+        self.ft_batch_row2 = ttk.Frame(self.ft_batch_frame)
+        self.ft_batch_row2.pack(fill=tk.X, pady=4)
+        self.ft_batch_local_label = ttk.Label(self.ft_batch_row2, text="Local files:")
+        self.ft_batch_local_label.pack(anchor=tk.W)
+        br = ttk.Frame(self.ft_batch_row2)
+        br.pack(fill=tk.X)
+        ttk.Button(br, text="Browse files…", command=self._ft_browse_batch_upload_files).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(br, text="Clear file list", command=self._ft_clear_batch_files).pack(side=tk.LEFT, padx=(0, 8))
+        self.ft_upload_binary_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(br, text="Binary (chmod +x after upload)", variable=self.ft_upload_binary_var).pack(side=tk.LEFT)
+        self.ft_batch_files_list = tk.Listbox(self.ft_batch_frame, height=4, selectmode=tk.EXTENDED)
+        self.ft_batch_files_list.pack(fill=tk.BOTH, expand=True, pady=4)
+
+        self.ft_batch_dl_row = ttk.Frame(self.ft_batch_frame)
+        ttk.Label(
+            self.ft_batch_dl_row,
+            text="Remote file paths on APs (one per line; same list for every selected AP):",
+        ).pack(anchor=tk.W)
+        self.ft_batch_remote_paths_text = scrolledtext.ScrolledText(
+            self.ft_batch_dl_row, height=4, width=70, wrap=tk.NONE
+        )
+        self.ft_batch_remote_paths_text.pack(fill=tk.BOTH, expand=True, pady=2)
+        ttk.Label(self.ft_batch_dl_row, text="Local folder (each AP gets a subfolder):").pack(anchor=tk.W, pady=(6, 0))
+        dl_b = ttk.Frame(self.ft_batch_dl_row)
+        dl_b.pack(fill=tk.X)
+        self.ft_batch_local_dir_var = tk.StringVar()
+        ttk.Entry(dl_b, textvariable=self.ft_batch_local_dir_var, width=55).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(dl_b, text="Browse…", command=self._ft_browse_batch_local_dir).pack(side=tk.LEFT, padx=6)
+
+        self.ft_explorer_frame = ttk.LabelFrame(self.ft_body, text=" Single AP browser ", padding=8)
+        ttk.Label(
+            self.ft_explorer_frame,
+            text="Large files may be slow (base64 over shell).",
+            foreground="#666",
+        ).pack(anchor=tk.W, pady=(0, 6))
+
+        exp_grid = ttk.Frame(self.ft_explorer_frame)
+        exp_grid.pack(fill=tk.BOTH, expand=True)
+        self.ft_remote_cwd_var = tk.StringVar(value="/tmp")
+        loc_lab = ttk.LabelFrame(exp_grid, text=" Local ", padding=6)
+        rem_lab = ttk.LabelFrame(exp_grid, text=" Remote (AP) ", padding=6)
+        loc_lab.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        rem_lab.grid(row=0, column=1, sticky="nsew")
+        exp_grid.columnconfigure(0, weight=1)
+        exp_grid.columnconfigure(1, weight=1)
+        exp_grid.rowconfigure(0, weight=1)
+
+        lf_top = ttk.Frame(loc_lab)
+        lf_top.pack(fill=tk.X)
+        self.ft_local_cwd_var = tk.StringVar(value=str(self.ft_local_cwd))
+        ttk.Entry(lf_top, textvariable=self.ft_local_cwd_var, width=40).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(lf_top, text="Go", command=self._ft_local_go).pack(side=tk.LEFT, padx=4)
+        ttk.Button(lf_top, text="Refresh", command=self._ft_refresh_local_list).pack(side=tk.LEFT)
+        self.ft_local_list = tk.Listbox(loc_lab, selectmode=tk.EXTENDED, height=10)
+        self.ft_local_list.pack(fill=tk.BOTH, expand=True, pady=4)
+        self.ft_local_list.bind("<Double-1>", self._ft_local_double_click)
+
+        rf_top = ttk.Frame(rem_lab)
+        rf_top.pack(fill=tk.X)
+        ttk.Entry(rf_top, textvariable=self.ft_remote_cwd_var, width=40).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(rf_top, text="Go", command=self._ft_remote_go).pack(side=tk.LEFT, padx=4)
+        self.ft_remote_refresh_btn = ttk.Button(rf_top, text="Refresh", command=self._ft_refresh_remote_list)
+        self.ft_remote_refresh_btn.pack(side=tk.LEFT)
+        self.ft_remote_list = tk.Listbox(rem_lab, selectmode=tk.EXTENDED, height=10)
+        self.ft_remote_list.pack(fill=tk.BOTH, expand=True, pady=4)
+        self.ft_remote_list.bind("<Double-1>", self._ft_remote_double_click)
+
+        ex_btn = ttk.Frame(self.ft_explorer_frame)
+        ex_btn.pack(fill=tk.X, pady=6)
+        ttk.Button(ex_btn, text="Upload selected → AP", command=self._ft_explorer_upload).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Checkbutton(
+            ex_btn,
+            text="Binary (+x)",
+            variable=self.ft_upload_binary_var,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(ex_btn, text="Download selected ← AP", command=self._ft_explorer_download).pack(side=tk.LEFT)
+
+        self.ft_explorer_frame.pack_forget()
+
+        log_fr = ttk.LabelFrame(mid_log, text=" Transfer log ", padding=8)
+        mid_log.add(log_fr, weight=2)
+        self.ft_log_text = scrolledtext.ScrolledText(log_fr, height=8, wrap=tk.WORD)
+        self.ft_log_text.pack(fill=tk.BOTH, expand=True)
+        ttk.Button(log_fr, text="Clear log", command=self._ft_clear_log).pack(anchor=tk.E, pady=(4, 0))
+
+        self.ft_summary_text = tk.Text(right, height=22, width=36, wrap=tk.WORD, state=tk.DISABLED)
+        self.ft_summary_text.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+
+        act = ttk.Frame(right)
+        act.pack(fill=tk.X)
+        self.ft_run_btn = ttk.Button(act, text="Run transfer", command=self._ft_run_transfer, style="Primary.TButton")
+        self.ft_run_btn.pack(fill=tk.X, pady=(0, 6))
+        self.ft_stop_btn = ttk.Button(act, text="Stop transfer", command=self._ft_stop_transfer, state=tk.DISABLED)
+        self.ft_stop_btn.pack(fill=tk.X, pady=(0, 6))
+        ttk.Button(act, text="Clear form", command=self._ft_clear_form).pack(fill=tk.X)
+        self.ft_action_widgets.extend([self.ft_run_btn, self.ft_stop_btn, self.ft_remote_refresh_btn, self.ft_explorer_frame])
+        self.ft_sessions: Dict[str, Any] = {}
+        self.ft_session_locks: Dict[str, threading.Lock] = {}
+        self.ft_transfer_cancel_event = threading.Event()
+        self._ft_transfer_state_lock = threading.Lock()
+        self._ft_transfer_active_child: Any = None
+        self._ft_transfer_active_iid: Optional[str] = None
+
+        self._ft_on_mode_change()
+        self._ft_update_selection_layout()
+        self._ft_sync_run_button_state()
+
+    def _on_app_window_close(self) -> None:
+        try:
+            self._ft_disconnect_all()
+        except Exception:
+            pass
+        self.root.destroy()
+
+    def _ft_lock_for(self, iid: str) -> threading.Lock:
+        if iid not in self.ft_session_locks:
+            self.ft_session_locks[iid] = threading.Lock()
+        return self.ft_session_locks[iid]
+
+    def _ft_parse_download_timeout_sec(self) -> float:
+        raw = (self.ft_download_timeout_var.get() or "").strip()
+        try:
+            v = int(float(raw))
+        except ValueError:
+            raise ValueError("invalid")
+        if v < 30 or v > 86400:
+            raise ValueError("range")
+        return float(v)
+
+    def _ft_begin_transfer_ops(self, iid: str, child: Any) -> None:
+        with self._ft_transfer_state_lock:
+            self._ft_transfer_active_iid = iid
+            self._ft_transfer_active_child = child
+
+    def _ft_end_transfer_ops(self) -> None:
+        with self._ft_transfer_state_lock:
+            self._ft_transfer_active_child = None
+            self._ft_transfer_active_iid = None
+
+    def _ft_stop_transfer(self) -> None:
+        self.ft_transfer_cancel_event.set()
+        ch: Any = None
+        iid: Optional[str] = None
+        with self._ft_transfer_state_lock:
+            ch = self._ft_transfer_active_child
+            iid = self._ft_transfer_active_iid
+        if ch is not None:
+            try:
+                ch.close(force=True)
+            except Exception:
+                pass
+        if iid:
+            lk = self._ft_lock_for(iid)
+            with lk:
+                self.ft_sessions.pop(iid, None)
+            self._ft_set_conn_status(iid, "Disconnected")
+        self._ft_log("Stop: transfer interrupted (session closed; reconnect if needed).")
+
+    def _ft_set_conn_status(self, iid: str, text: str) -> None:
+        if not self.ft_tree.exists(iid):
+            return
+        vals = list(self.ft_tree.item(iid)["values"])
+        while len(vals) < 7:
+            vals.append("Disconnected")
+        vals[6] = text
+        self.ft_tree.item(iid, values=tuple(vals))
+
+    def _ft_disconnect_all(self) -> None:
+        """Close all persistent device shells and reset Connection column."""
+        try:
+            sc = self._ft_import_sshcommand()
+        except Exception:
+            sc = None
+
+        def _lo(_m: str) -> None:
+            return None
+
+        for iid in list(self.ft_sessions.keys()):
+            lk = self._ft_lock_for(iid)
+            with lk:
+                ch = self.ft_sessions.pop(iid, None)
+            if ch is not None and sc is not None:
+                try:
+                    sc.detach_device_shell(ch, 120.0, _lo)
+                except Exception:
+                    try:
+                        ch.close(force=True)
+                    except Exception:
+                        pass
+            elif ch is not None:
+                try:
+                    ch.close(force=True)
+                except Exception:
+                    pass
+
+        for ent in self.ft_inventory:
+            if self.ft_tree.exists(ent["iid"]):
+                st = "—" if not ent["eligible"] else "Disconnected"
+                self._ft_set_conn_status(ent["iid"], st)
+
+    def _ft_iid_for_device(self, sc: Any, name: str, port: int) -> Optional[str]:
+        for ent in self.ft_inventory:
+            r = ent["raw"]
+            if (r.get("Name") or "") != name:
+                continue
+            p = sc.is_valid_sdm_port(r.get("SDM Port") or "")
+            if p == port:
+                return ent["iid"]
+        return None
+
+    def _ft_single_selection_iid(self) -> Optional[str]:
+        rows = self._ft_get_selected_raw_rows()
+        if len(rows) != 1:
+            return None
+        r0 = rows[0]
+        for ent in self.ft_inventory:
+            if not ent["eligible"]:
+                continue
+            vals = self.ft_tree.item(ent["iid"])["values"]
+            if not vals or vals[0] != "☑":
+                continue
+            r = ent["raw"]
+            if r.get("Name") == r0.get("Name") and (r.get("SDM Port") or "") == (r0.get("SDM Port") or ""):
+                return ent["iid"]
+        return None
+
+    def _ft_connect_clicked(self) -> None:
+        if not self._ft_ssh_settings_ok():
+            return
+        targets: List[Tuple[str, Dict[str, str]]] = []
+        for ent in self.ft_inventory:
+            if not ent["eligible"]:
+                continue
+            vals = self.ft_tree.item(ent["iid"])["values"]
+            if vals and vals[0] == "☑":
+                targets.append((ent["iid"], ent["raw"]))
+        if not targets:
+            messagebox.showwarning("Connect", "Check at least one eligible AP.")
+            return
+        threading.Thread(target=self._ft_connect_worker, args=(targets,), daemon=True).start()
+
+    def _ft_connect_worker(self, targets: List[Tuple[str, Dict[str, str]]]) -> None:
+        try:
+            sc, ssh_cmd = self._ft_build_ssh()
+        except Exception as e:
+            self.root.after(0, lambda err=str(e): self._ft_log(f"Connect failed: {err}"))
+            return
+        for iid, raw in targets:
+            port = sc.is_valid_sdm_port(raw.get("SDM Port") or "")
+            if port is None:
+                continue
+            lock = self._ft_lock_for(iid)
+            try:
+                with lock:
+                    old = self.ft_sessions.pop(iid, None)
+                    if old is not None:
+                        sc.detach_device_shell(old, 120.0, lambda _m: None)
+                self.root.after(0, lambda ii=iid: self._ft_set_conn_status(ii, "Connecting…"))
+
+                def mklog(ii: str) -> Callable[[str], None]:
+                    return lambda m: self.root.after(0, lambda mm=m, i2=ii: self._ft_log(f"[{i2}] {mm}"))
+
+                lg = mklog(iid)
+                with lock:
+                    child, err = sc.attach_device_shell(ssh_cmd, port, 120.0, 300.0, lg, False)
+                    if child:
+                        self.ft_sessions[iid] = child
+                        self.root.after(0, lambda ii=iid: self._ft_set_conn_status(ii, "Connected"))
+                    else:
+                        self.ft_sessions[iid] = None
+                        self.root.after(0, lambda ii=iid: self._ft_set_conn_status(ii, "Error"))
+                        self.root.after(0, lambda er=err, ii=iid: self._ft_log(f"[{ii}] {er}"))
+            except Exception as e:
+                self.root.after(0, lambda er=str(e), ii=iid: self._ft_log(f"[{ii}] Connect exception: {er}"))
+                self.root.after(0, lambda ii=iid: self._ft_set_conn_status(ii, "Error"))
+
+    def _ft_log(self, msg: str) -> None:
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.ft_log_text.insert(tk.END, f"[{ts}] {msg}\n")
+        self.ft_log_text.see(tk.END)
+
+    def _ft_clear_log(self) -> None:
+        self.ft_log_text.delete(1.0, tk.END)
+
+    def _ft_browse_rsa(self) -> None:
+        p = filedialog.askopenfilename(title="SSH private key", filetypes=[("All files", "*.*")])
+        if p:
+            self.ft_rsa_var.set(p)
+
+    def _ft_browse_csv(self) -> None:
+        p = filedialog.askopenfilename(title="Inventory CSV", filetypes=[("CSV", "*.csv"), ("All", "*.*")])
+        if p:
+            self._ft_load_csv(Path(p))
+
+    def _ft_load_csv(self, path: Path) -> None:
+        try:
+            with path.open(newline="", encoding="utf-8-sig") as f:
+                reader = csv.DictReader(f)
+                if not reader.fieldnames:
+                    messagebox.showerror("CSV", "CSV has no header row.")
+                    return
+                fn = list(reader.fieldnames)
+                if "Name" not in fn or "SDM Port" not in fn:
+                    messagebox.showerror("CSV", "CSV must include columns 'Name' and 'SDM Port'.")
+                    return
+                rows = list(reader)
+        except OSError as e:
+            messagebox.showerror("CSV", str(e))
+            return
+
+        self._ft_disconnect_all()
+
+        self.ft_csv_path = path.resolve()
+        self.ft_csv_fieldnames = fn
+        self.ft_inventory = []
+        sc = None
+        try:
+            sc = self._ft_import_sshcommand()
+        except Exception as e:
+            messagebox.showerror("Import", f"Could not load sshcommand: {e}")
+            return
+
+        for i, raw in enumerate(rows):
+            raw_copy = dict(raw)
+            st = (raw_copy.get("SDM Status") or "").strip()
+            port_ok = sc.is_valid_sdm_port(raw_copy.get("SDM Port") or "") is not None
+            eligible = st == "Enabled" and port_ok
+            self.ft_inventory.append({"iid": str(i), "raw": raw_copy, "eligible": eligible})
+
+        for it in self.ft_tree.get_children():
+            self.ft_tree.delete(it)
+        for entry in self.ft_inventory:
+            r = entry["raw"]
+            self.ft_tree.insert(
+                "",
+                tk.END,
+                iid=entry["iid"],
+                values=(
+                    "☐",
+                    r.get("Name", "") or "",
+                    r.get("IP", "") or "",
+                    r.get("Model", "") or "",
+                    r.get("SDM Status", "") or "",
+                    r.get("SDM Port", "") or "",
+                    "—" if not entry["eligible"] else "Disconnected",
+                ),
+            )
+
+        n_elig = sum(1 for e in self.ft_inventory if e["eligible"])
+        self.ft_csv_label_var.set(f"Loaded: {path.name} — rows={len(self.ft_inventory)}, eligible (Enabled + valid port)={n_elig}")
+        self._ft_update_summary()
+        self._ft_log(f"Loaded CSV {path} ({len(self.ft_inventory)} rows, {n_elig} eligible).")
+        self._ft_sync_run_button_state()
+
+    def _ft_toggle_row(self, event: tk.Event) -> None:
+        row_id = self.ft_tree.identify_row(event.y)
+        if not row_id:
+            return
+        idx = int(row_id)
+        entry = self.ft_inventory[idx]
+        if not entry["eligible"]:
+            messagebox.showwarning("Selection", "Only rows with SDM Status=Enabled and a valid SDM Port can be selected.")
+            return
+        vals = list(self.ft_tree.item(row_id)["values"])
+        while len(vals) < 7:
+            vals.append("Disconnected")
+        vals[0] = "☑" if vals[0] == "☐" else "☐"
+        self.ft_tree.item(row_id, values=vals)
+        self._ft_on_tree_select()
+
+    def _ft_check_all(self) -> None:
+        for entry in self.ft_inventory:
+            if not entry["eligible"]:
+                continue
+            iid = entry["iid"]
+            vals = list(self.ft_tree.item(iid)["values"])
+            while len(vals) < 7:
+                vals.append("Disconnected")
+            vals[0] = "☑"
+            self.ft_tree.item(iid, values=vals)
+        self._ft_on_tree_select()
+
+    def _ft_check_none(self) -> None:
+        for entry in self.ft_inventory:
+            iid = entry["iid"]
+            vals = list(self.ft_tree.item(iid)["values"])
+            while len(vals) < 7:
+                vals.append("Disconnected")
+            vals[0] = "☐"
+            self.ft_tree.item(iid, values=vals)
+        self._ft_on_tree_select()
+
+    def _ft_count_selected_eligible(self) -> int:
+        n = 0
+        for entry in self.ft_inventory:
+            if not entry["eligible"]:
+                continue
+            vals = self.ft_tree.item(entry["iid"])["values"]
+            if vals and vals[0] == "☑":
+                n += 1
+        return n
+
+    def _ft_get_selected_raw_rows(self) -> List[Dict[str, str]]:
+        out: List[Dict[str, str]] = []
+        for entry in self.ft_inventory:
+            if not entry["eligible"]:
+                continue
+            vals = self.ft_tree.item(entry["iid"])["values"]
+            if vals and vals[0] == "☑":
+                out.append(entry["raw"])
+        return out
+
+    def _ft_single_selection_port(self) -> Optional[int]:
+        rows = self._ft_get_selected_raw_rows()
+        if len(rows) != 1:
+            return None
+        sc = self._ft_import_sshcommand()
+        return sc.is_valid_sdm_port(rows[0].get("SDM Port") or "")
+
+    def _ft_on_tree_select(self) -> None:
+        self.ft_sel_count_var.set(f"Selected eligible APs: {self._ft_count_selected_eligible()}")
+        self._ft_update_selection_layout()
+        self._ft_update_summary()
+        self._ft_sync_run_button_state()
+
+    def _ft_update_selection_layout(self) -> None:
+        if self._ft_count_selected_eligible() == 1:
+            self.ft_batch_frame.pack_forget()
+            self.ft_explorer_frame.pack(fill=tk.BOTH, expand=True)
+            self.ft_local_cwd_var.set(str(self.ft_local_cwd))
+            self._ft_refresh_local_list()
+        else:
+            self.ft_explorer_frame.pack_forget()
+            self.ft_batch_frame.pack(fill=tk.BOTH, expand=True)
+
+    def _ft_on_mode_change(self) -> None:
+        mode = self.ft_mode_var.get()
+        if mode == "upload":
+            self.ft_batch_row1.pack(fill=tk.X, pady=4)
+            self.ft_batch_path_label.config(text="Destination directory on APs (must exist):")
+            self.ft_batch_row2.pack(fill=tk.X, pady=4)
+            self.ft_batch_local_label.config(text="Local files to upload:")
+            self.ft_batch_files_list.pack(fill=tk.BOTH, expand=True, pady=4)
+            self.ft_batch_dl_row.pack_forget()
+        else:
+            self.ft_batch_row1.pack_forget()
+            self.ft_batch_row2.pack_forget()
+            self.ft_batch_files_list.pack_forget()
+            self.ft_batch_dl_row.pack(fill=tk.BOTH, expand=True, pady=4)
+        self._ft_update_summary()
+
+    def _ft_browse_batch_upload_files(self) -> None:
+        paths = filedialog.askopenfilenames(title="Files to upload")
+        if not paths:
+            return
+        for p in paths:
+            lp = Path(p).resolve()
+            if lp.is_file() and lp not in self.ft_batch_upload_paths:
+                self.ft_batch_upload_paths.append(lp)
+        self.ft_batch_files_list.delete(0, tk.END)
+        for p in self.ft_batch_upload_paths:
+            self.ft_batch_files_list.insert(tk.END, str(p))
+        self._ft_update_summary()
+
+    def _ft_clear_batch_files(self) -> None:
+        self.ft_batch_upload_paths.clear()
+        self.ft_batch_files_list.delete(0, tk.END)
+        self._ft_update_summary()
+
+    def _ft_browse_batch_local_dir(self) -> None:
+        d = filedialog.askdirectory(title="Download folder")
+        if d:
+            self.ft_batch_local_dir_var.set(d)
+            self._ft_update_summary()
+
+    def _ft_clear_form(self) -> None:
+        self.ft_url_var.set("")
+        self.ft_rsa_var.set("")
+        self.ft_ssh_port_var.set("443")
+        self.ft_batch_ap_path_var.set("")
+        self.ft_batch_remote_paths_text.delete("1.0", tk.END)
+        self.ft_batch_local_dir_var.set("")
+        self.ft_upload_binary_var.set(False)
+        if hasattr(self, "ft_download_timeout_var"):
+            self.ft_download_timeout_var.set("900")
+        self._ft_clear_batch_files()
+        self._ft_disconnect_all()
+        self._ft_update_summary()
+
+    def _ft_update_summary(self) -> None:
+        lines = []
+        lines.append(f"CSV: {self.ft_csv_path.name if self.ft_csv_path else '-'}")
+        lines.append(f"Selected APs: {self._ft_count_selected_eligible()}")
+        lines.append(f"Mode: {self.ft_mode_var.get()}")
+        if self.ft_mode_var.get() == "upload":
+            lines.append(f"Files queued: {len(self.ft_batch_upload_paths)}")
+            lines.append(f"AP dest: {self.ft_batch_ap_path_var.get().strip() or '-'}")
+        else:
+            nrp = len(self._ft_get_batch_remote_paths())
+            lines.append(f"Remote paths: {nrp} file(s)" if nrp else "Remote paths: -")
+            lines.append(f"Local folder: {self.ft_batch_local_dir_var.get().strip() or '-'}")
+            try:
+                lines.append(f"Download timeout: {int(self._ft_parse_download_timeout_sec())}s")
+            except ValueError:
+                lines.append("Download timeout: (invalid)")
+        self.ft_summary_text.config(state=tk.NORMAL)
+        self.ft_summary_text.delete(1.0, tk.END)
+        self.ft_summary_text.insert(tk.END, "\n".join(lines))
+        self.ft_summary_text.config(state=tk.DISABLED)
+        mode = self.ft_mode_var.get()
+        self.ft_run_btn.config(text="Upload" if mode == "upload" else "Download")
+        self._ft_sync_run_button_state()
+
+    def _ft_sync_run_button_state(self) -> None:
+        if not hasattr(self, "ft_run_btn"):
+            return
+        one = self._ft_count_selected_eligible() == 1
+        st = tk.DISABLED if self.ft_busy or one else tk.NORMAL
+        self.ft_run_btn.config(state=st)
+
+    def _ft_set_busy(self, busy: bool) -> None:
+        self.ft_busy = busy
+        self.ft_remote_refresh_btn.config(state=tk.DISABLED if busy else tk.NORMAL)
+        if hasattr(self, "ft_stop_btn"):
+            self.ft_stop_btn.config(state=tk.NORMAL if busy else tk.DISABLED)
+        self._ft_sync_run_button_state()
+
+    def _ft_ssh_settings_ok(self) -> bool:
+        url = self.ft_url_var.get().strip()
+        rsa = self.ft_rsa_var.get().strip()
+        if not url or "@" not in url:
+            messagebox.showerror("SSH", "Enter jump URL as user@host.")
+            return False
+        if not rsa or not Path(rsa).expanduser().is_file():
+            messagebox.showerror("SSH", "Choose a valid SSH private key file.")
+            return False
+        try:
+            int(self.ft_ssh_port_var.get().strip() or "443")
+        except ValueError:
+            messagebox.showerror("SSH", "Jump SSH port must be an integer.")
+            return False
+        return True
+
+    def _ft_write_temp_csv(self, rows: List[Dict[str, str]]) -> Path:
+        fd, name = tempfile.mkstemp(suffix=".csv", prefix="sdm_ft_")
+        os.close(fd)
+        p = Path(name)
+        with p.open("w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=self.ft_csv_fieldnames, extrasaction="ignore")
+            w.writeheader()
+            for r in rows:
+                w.writerow({k: r.get(k, "") for k in self.ft_csv_fieldnames})
+        return p
+
+    def _ft_sanitize_dir_name(self, name: str) -> str:
+        s = re.sub(r"[^\w\-.]+", "_", (name or "ap").strip())[:120]
+        return s or "ap"
+
+    def _ft_get_batch_remote_paths(self) -> List[str]:
+        """Non-empty lines from the batch download remote-paths text box."""
+        raw = self.ft_batch_remote_paths_text.get("1.0", tk.END)
+        return [ln.strip() for ln in raw.splitlines() if ln.strip()]
+
+    def _ft_run_transfer(self) -> None:
+        if self.ft_busy:
+            return
+        if not self._ft_ssh_settings_ok():
+            return
+        rows = self._ft_get_selected_raw_rows()
+        if not rows:
+            messagebox.showwarning("Transfer", "Select at least one eligible AP.")
+            return
+        if not self.ft_csv_fieldnames:
+            messagebox.showwarning("Transfer", "Load a CSV first.")
+            return
+
+        mode = self.ft_mode_var.get()
+        if len(rows) > 1:
+            if mode == "upload":
+                dest = self.ft_batch_ap_path_var.get().strip()
+                if not dest:
+                    messagebox.showerror("Upload", "Enter destination directory on APs.")
+                    return
+                if not self.ft_batch_upload_paths:
+                    messagebox.showerror("Upload", "Choose one or more local files.")
+                    return
+            else:
+                rpaths = self._ft_get_batch_remote_paths()
+                lf = self.ft_batch_local_dir_var.get().strip()
+                if not rpaths or not lf:
+                    messagebox.showerror(
+                        "Download",
+                        "Enter at least one remote file path (one per line) and a local folder.",
+                    )
+                    return
+                if not Path(lf).expanduser().is_dir():
+                    messagebox.showerror("Download", "Local folder must exist.")
+                    return
+                try:
+                    self._ft_parse_download_timeout_sec()
+                except ValueError:
+                    messagebox.showerror(
+                        "Download",
+                        "Download timeout must be a number between 30 and 86400 seconds.",
+                    )
+                    return
+        threading.Thread(target=self._ft_run_transfer_thread, daemon=True).start()
+
+    def _ft_run_transfer_thread(self) -> None:
+        self.ft_transfer_cancel_event.clear()
+        self.root.after(0, lambda: self._ft_set_busy(True))
+        try:
+            rows = self._ft_get_selected_raw_rows()
+            mode = self.ft_mode_var.get()
+            if len(rows) > 1:
+                tmp = self._ft_write_temp_csv(rows)
+                try:
+                    if mode == "upload":
+                        self._ft_exec_batch_upload(tmp)
+                    else:
+                        self._ft_exec_batch_download(tmp)
+                finally:
+                    try:
+                        tmp.unlink()
+                    except OSError:
+                        pass
+            elif len(rows) == 1:
+                pass
+        except Exception as e:
+            self.root.after(0, lambda: self._ft_log(f"ERROR: {e}"))
+            self.root.after(0, lambda err=str(e): messagebox.showerror("Transfer", err))
+        finally:
+            self.root.after(0, lambda: self._ft_set_busy(False))
+
+    def _ft_build_ssh(self) -> Tuple[Any, List[str]]:
+        sc = self._ft_import_sshcommand()
+        user, host = sc.parse_user_at_host(self.ft_url_var.get().strip())
+        port = int(self.ft_ssh_port_var.get().strip() or "443")
+        key = Path(self.ft_rsa_var.get().strip()).expanduser()
+        ssh_cmd = sc.build_ssh_cmd(
+            user,
+            host,
+            port,
+            key,
+            strict_host_key_checking=True,
+            accept_new_host_key=True,
+        )
+        return sc, ssh_cmd
+
+    def _ft_exec_batch_upload(self, csv_path: Path) -> None:
+        sc, ssh_cmd = self._ft_build_ssh()
+        dest_base = self.ft_batch_ap_path_var.get().strip().rstrip("/")
+        uploads = []
+        want_x = self.ft_upload_binary_var.get()
+        for lp in self.ft_batch_upload_paths:
+            spec = sc.parse_upload_arg(f"{lp}:{posixpath.join(dest_base, lp.name)}")
+            if want_x:
+                spec = replace(spec, chmod_mode="+x")
+            uploads.append(spec)
+        devices = list(
+            sc.iter_target_devices(
+                csv_path,
+                port_column="SDM Port",
+                name_column="Name",
+                require_sdm_enabled=True,
+            )
+        )
+        if not devices:
+            self.root.after(0, lambda: self._ft_log("No devices in temp CSV (check SDM Enabled + port)."))
+            return
+
+        connect_t = 120.0
+        cmd_t = 300.0
+        for dev in devices:
+            tag = f"[{dev.name} port={dev.sdm_port}]"
+            iid = self._ft_iid_for_device(sc, dev.name, dev.sdm_port)
+            if not iid:
+                self.root.after(0, lambda t=tag: self._ft_log(f"{t} skipped (no table row)."))
+                continue
+
+            def make_log(t: str) -> Callable[[str], None]:
+                return lambda m: self.root.after(0, lambda mm=m, tt=t: self._ft_log(f"{tt} {mm}"))
+
+            lk = self._ft_lock_for(iid)
+            with lk:
+                ch = self.ft_sessions.get(iid)
+            if not ch:
+                self.root.after(0, lambda t=tag: self._ft_log(f"{t} Connect first (skipped)."))
+                continue
+            self._ft_begin_transfer_ops(iid, ch)
+            try:
+                ok, det = sc.run_ops_on_open_shell(
+                    ch,
+                    uploads,
+                    [],
+                    [],
+                    cmd_t,
+                    make_log(tag),
+                    make_log(tag),
+                    cancel_event=self.ft_transfer_cancel_event,
+                )
+            finally:
+                self._ft_end_transfer_ops()
+            if ok:
+                self.root.after(0, lambda t=tag: self._ft_log(f"{t} done."))
+            else:
+                self.root.after(0, lambda t=tag, d=det: self._ft_log(f"{t} FAILED: {d}"))
+            if getattr(ch, "closed", False):
+                lk2 = self._ft_lock_for(iid)
+                with lk2:
+                    if self.ft_sessions.get(iid) is ch:
+                        self.ft_sessions.pop(iid, None)
+                self._ft_set_conn_status(iid, "Disconnected")
+            if not ok and det == "cancelled":
+                break
+
+    def _ft_exec_batch_download(self, csv_path: Path) -> None:
+        sc, ssh_cmd = self._ft_build_ssh()
+        remote_paths = self._ft_get_batch_remote_paths()
+        local_root = Path(self.ft_batch_local_dir_var.get().strip()).expanduser()
+        devices = list(
+            sc.iter_target_devices(
+                csv_path,
+                port_column="SDM Port",
+                name_column="Name",
+                require_sdm_enabled=True,
+            )
+        )
+        if not devices:
+            self.root.after(0, lambda: self._ft_log("No devices in temp CSV."))
+            return
+
+        try:
+            dl_sec = self._ft_parse_download_timeout_sec()
+        except ValueError:
+            dl_sec = 900.0
+
+        connect_t = 120.0
+        cmd_t = 300.0
+        for dev in devices:
+            tag = f"[{dev.name} port={dev.sdm_port}]"
+            iid = self._ft_iid_for_device(sc, dev.name, dev.sdm_port)
+            if not iid:
+                self.root.after(0, lambda t=tag: self._ft_log(f"{t} skipped (no table row)."))
+                continue
+            sub = local_root / self._ft_sanitize_dir_name(dev.name)
+            sub.mkdir(parents=True, exist_ok=True)
+            downloads = []
+            for remote_file in remote_paths:
+                base_name = posixpath.basename(remote_file) or "download"
+                local_path = sub / base_name
+                downloads.append(sc.parse_download_arg(f"{remote_file}:{local_path}"))
+
+            def make_log(t: str) -> Callable[[str], None]:
+                return lambda m: self.root.after(0, lambda mm=m, tt=t: self._ft_log(f"{tt} {mm}"))
+
+            lk = self._ft_lock_for(iid)
+            with lk:
+                ch = self.ft_sessions.get(iid)
+            if not ch:
+                self.root.after(0, lambda t=tag: self._ft_log(f"{t} Connect first (skipped)."))
+                continue
+            self._ft_begin_transfer_ops(iid, ch)
+            try:
+                ok, det = sc.run_ops_on_open_shell(
+                    ch,
+                    [],
+                    [],
+                    downloads,
+                    cmd_t,
+                    make_log(tag),
+                    make_log(tag),
+                    download_timeout=dl_sec,
+                    cancel_event=self.ft_transfer_cancel_event,
+                )
+            finally:
+                self._ft_end_transfer_ops()
+            if ok:
+                self.root.after(
+                    0,
+                    lambda t=tag, n=len(downloads), sd=sub: self._ft_log(
+                        f"{t} saved {n} file(s) under {sd}"
+                    ),
+                )
+            else:
+                self.root.after(0, lambda t=tag, d=det: self._ft_log(f"{t} FAILED: {d}"))
+            if getattr(ch, "closed", False):
+                lk2 = self._ft_lock_for(iid)
+                with lk2:
+                    if self.ft_sessions.get(iid) is ch:
+                        self.ft_sessions.pop(iid, None)
+                self._ft_set_conn_status(iid, "Disconnected")
+            if not ok and det == "cancelled":
+                break
+
+    def _ft_local_go(self) -> None:
+        p = Path(self.ft_local_cwd_var.get().strip()).expanduser()
+        if p.is_dir():
+            self.ft_local_cwd = p.resolve()
+            self.ft_local_cwd_var.set(str(self.ft_local_cwd))
+            self._ft_refresh_local_list()
+        else:
+            messagebox.showerror("Local", "Not a directory.")
+
+    def _ft_refresh_local_list(self) -> None:
+        self.ft_local_list.delete(0, tk.END)
+        try:
+            names = sorted(self.ft_local_cwd.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))
+        except OSError as e:
+            self.ft_local_list.insert(tk.END, f"(error: {e})")
+            return
+        cur = self.ft_local_cwd.resolve()
+        if cur != cur.parent:
+            self.ft_local_list.insert(tk.END, "..")
+        for ch in names:
+            mark = "/" if ch.is_dir() else ""
+            self.ft_local_list.insert(tk.END, f"{ch.name}{mark}")
+
+    def _ft_local_double_click(self, event: tk.Event) -> None:
+        sel = self.ft_local_list.curselection()
+        if not sel:
+            return
+        name = self.ft_local_list.get(sel[0]).rstrip("/")
+        if name == "..":
+            self.ft_local_cwd = self.ft_local_cwd.parent.resolve()
+            self.ft_local_cwd_var.set(str(self.ft_local_cwd))
+            self._ft_refresh_local_list()
+            return
+        p = (self.ft_local_cwd / name).resolve()
+        if p.is_dir():
+            self.ft_local_cwd = p
+            self.ft_local_cwd_var.set(str(self.ft_local_cwd))
+            self._ft_refresh_local_list()
+
+    def _ft_remote_go(self) -> None:
+        self._ft_refresh_remote_list()
+
+    def _ft_refresh_remote_list(self) -> None:
+        if self._ft_count_selected_eligible() != 1:
+            return
+        threading.Thread(target=self._ft_remote_list_thread, daemon=True).start()
+
+    def _ft_remote_list_thread(self) -> None:
+        self.root.after(0, lambda: self._ft_set_busy(True))
+        try:
+            iid = self._ft_single_selection_iid()
+            if not iid:
+                return
+            sc, _ssh_cmd = self._ft_build_ssh()
+            rp = self.ft_remote_cwd_var.get().strip() or "/"
+            cmd = f"ls -1A {shlex.quote(rp)}"
+            tag = "[remote]"
+
+            def lg(m: str) -> None:
+                self.root.after(0, lambda mm=m, tt=tag: self._ft_log(f"{tt} {mm}"))
+
+            lk = self._ft_lock_for(iid)
+            with lk:
+                ch = self.ft_sessions.get(iid)
+            if not ch:
+                self.root.after(0, lambda: self._ft_log("Remote list: Connect first."))
+                return
+            outputs: List[str] = []
+            ok, err2 = sc.run_ops_on_open_shell(
+                ch,
+                [],
+                [cmd],
+                [],
+                120.0,
+                lg,
+                lg,
+                command_outputs=outputs,
+            )
+            if not ok:
+                self.root.after(0, lambda er=err2: self._ft_log(f"Remote list failed: {er}"))
+                return
+            text = outputs[0] if outputs else ""
+            lines = [sc._strip_ansi(ln) for ln in text.splitlines() if ln.strip()]
+            if ".." not in lines and rp not in ("/", ""):
+                lines = [".."] + lines
+
+            def apply() -> None:
+                self.ft_remote_list.delete(0, tk.END)
+                for ln in lines:
+                    self.ft_remote_list.insert(tk.END, ln)
+
+            self.root.after(0, apply)
+        finally:
+            self.root.after(0, lambda: self._ft_set_busy(False))
+
+    def _ft_remote_double_click(self, event: tk.Event) -> None:
+        if self._ft_count_selected_eligible() != 1:
+            return
+        sel = self.ft_remote_list.curselection()
+        if not sel:
+            return
+        name = self.ft_remote_list.get(sel[0]).strip()
+        base = self.ft_remote_cwd_var.get().strip() or "/"
+        if name == "..":
+            if base == "/":
+                parent = "/"
+            else:
+                parent = posixpath.normpath(posixpath.join(base, ".."))
+            self.ft_remote_cwd_var.set(parent or "/")
+            self._ft_refresh_remote_list()
+            return
+        full = posixpath.normpath(posixpath.join(base, name))
+        threading.Thread(target=lambda: self._ft_remote_nav_thread(full), daemon=True).start()
+
+    def _ft_remote_nav_thread(self, full: str) -> None:
+        self.root.after(0, lambda: self._ft_set_busy(True))
+        try:
+            iid = self._ft_single_selection_iid()
+            if not iid:
+                return
+            sc, _ssh_cmd = self._ft_build_ssh()
+            cmd = f"if [ -d {shlex.quote(full)} ]; then echo __D__; elif [ -f {shlex.quote(full)} ] || [ -L {shlex.quote(full)} ]; then echo __F__; else echo __E__; fi"
+
+            def lg(m: str) -> None:
+                pass
+
+            lk = self._ft_lock_for(iid)
+            with lk:
+                ch = self.ft_sessions.get(iid)
+            if not ch:
+                self.root.after(0, lambda: self._ft_log("Remote nav: Connect first."))
+                return
+            outs: List[str] = []
+            ok, res = sc.run_ops_on_open_shell(
+                ch,
+                [],
+                [cmd],
+                [],
+                60.0,
+                lg,
+                lg,
+                command_outputs=outs,
+            )
+            if not ok:
+                self.root.after(0, lambda rr=res: self._ft_log(f"Remote check failed: {rr}"))
+                return
+            if not outs:
+                self.root.after(0, lambda: self._ft_log("Remote check: empty output."))
+                return
+            out = (outs[0] or "").strip()
+            if "__D__" in out:
+                self.root.after(0, lambda ff=full: self.ft_remote_cwd_var.set(ff))
+                self.root.after(0, self._ft_refresh_remote_list)
+            elif "__F__" in out:
+                self.root.after(0, lambda ff=full: self._ft_log(f"(file) {ff}"))
+            else:
+                self.root.after(0, lambda ff=full: self._ft_log(f"Not found: {ff}"))
+        finally:
+            self.root.after(0, lambda: self._ft_set_busy(False))
+
+    def _ft_explorer_upload(self) -> None:
+        if self._ft_count_selected_eligible() != 1:
+            messagebox.showwarning("Upload", "Select exactly one eligible AP.")
+            return
+        sels = self.ft_local_list.curselection()
+        if not sels:
+            messagebox.showwarning("Upload", "Select local file(s) in the left list.")
+            return
+        paths: List[Path] = []
+        for i in sels:
+            label = self.ft_local_list.get(i).rstrip("/")
+            if label.endswith("/") or label == "..":
+                messagebox.showwarning("Upload", "Select files only (not directories).")
+                return
+            p = self.ft_local_cwd / label
+            if not p.is_file():
+                messagebox.showwarning("Upload", f"Not a file: {p}")
+                return
+            paths.append(p.resolve())
+        threading.Thread(target=lambda: self._ft_explorer_upload_thread(paths), daemon=True).start()
+
+    def _ft_explorer_upload_thread(self, paths: List[Path]) -> None:
+        self.ft_transfer_cancel_event.clear()
+        self.root.after(0, lambda: self._ft_set_busy(True))
+        try:
+            rows = self._ft_get_selected_raw_rows()
+            if len(rows) != 1:
+                return
+            iid = self._ft_single_selection_iid()
+            if not iid:
+                return
+            sc, _ssh_cmd = self._ft_build_ssh()
+            dest_base = self.ft_remote_cwd_var.get().strip().rstrip("/") or "/"
+            uploads = []
+            want_x = self.ft_upload_binary_var.get()
+            for lp in paths:
+                spec = sc.parse_upload_arg(f"{lp}:{posixpath.join(dest_base, lp.name)}")
+                if want_x:
+                    spec = replace(spec, chmod_mode="+x")
+                uploads.append(spec)
+            tag = f"[{rows[0].get('Name','')}]"
+
+            def lg(m: str) -> None:
+                self.root.after(0, lambda mm=m, tt=tag: self._ft_log(f"{tt} {mm}"))
+
+            lk = self._ft_lock_for(iid)
+            with lk:
+                ch = self.ft_sessions.get(iid)
+            if not ch:
+                self.root.after(0, lambda: self._ft_log("Upload: Connect first."))
+                return
+            self._ft_begin_transfer_ops(iid, ch)
+            try:
+                ok, det = sc.run_ops_on_open_shell(
+                    ch,
+                    uploads,
+                    [],
+                    [],
+                    300.0,
+                    lg,
+                    lg,
+                    cancel_event=self.ft_transfer_cancel_event,
+                )
+            finally:
+                self._ft_end_transfer_ops()
+            self.root.after(0, lambda tt=tag, ook=ok, ddet=det: self._ft_log(f"{tt} {'OK' if ook else 'FAILED: ' + str(ddet)}"))
+            if ok:
+                self.root.after(0, self._ft_refresh_remote_list)
+            if getattr(ch, "closed", False):
+                lk2 = self._ft_lock_for(iid)
+                with lk2:
+                    if self.ft_sessions.get(iid) is ch:
+                        self.ft_sessions.pop(iid, None)
+                self._ft_set_conn_status(iid, "Disconnected")
+        finally:
+            self.root.after(0, lambda: self._ft_set_busy(False))
+
+    def _ft_explorer_download(self) -> None:
+        if self._ft_count_selected_eligible() != 1:
+            messagebox.showwarning("Download", "Select exactly one eligible AP.")
+            return
+        sels = self.ft_remote_list.curselection()
+        if not sels:
+            messagebox.showwarning("Download", "Select remote file(s) in the right list.")
+            return
+        names = []
+        for i in sels:
+            n = self.ft_remote_list.get(i).strip()
+            if n == ".." or n.endswith("/"):
+                messagebox.showwarning("Download", "Select files only.")
+                return
+            names.append(n)
+        try:
+            self._ft_parse_download_timeout_sec()
+        except ValueError:
+            messagebox.showerror(
+                "Download",
+                "Download timeout must be a number between 30 and 86400 seconds.",
+            )
+            return
+        threading.Thread(target=lambda: self._ft_explorer_download_thread(names), daemon=True).start()
+
+    def _ft_explorer_download_thread(self, names: List[str]) -> None:
+        self.ft_transfer_cancel_event.clear()
+        self.root.after(0, lambda: self._ft_set_busy(True))
+        try:
+            try:
+                dl_sec = self._ft_parse_download_timeout_sec()
+            except ValueError:
+                dl_sec = 900.0
+                self.root.after(0, lambda: self._ft_log("Invalid download timeout; using 900s."))
+            rows = self._ft_get_selected_raw_rows()
+            if len(rows) != 1:
+                return
+            iid = self._ft_single_selection_iid()
+            if not iid:
+                return
+            sc, _ssh_cmd = self._ft_build_ssh()
+            base = self.ft_remote_cwd_var.get().strip().rstrip("/") or "/"
+            downloads = []
+            for n in names:
+                rpath = posixpath.join(base, n)
+                local_path = self.ft_local_cwd / n
+                downloads.append(sc.parse_download_arg(f"{rpath}:{local_path}"))
+            tag = f"[{rows[0].get('Name','')}]"
+
+            def lg(m: str) -> None:
+                self.root.after(0, lambda mm=m, tt=tag: self._ft_log(f"{tt} {mm}"))
+
+            lk = self._ft_lock_for(iid)
+            with lk:
+                ch = self.ft_sessions.get(iid)
+            if not ch:
+                self.root.after(0, lambda: self._ft_log("Download: Connect first."))
+                return
+            self._ft_begin_transfer_ops(iid, ch)
+            try:
+                ok, det = sc.run_ops_on_open_shell(
+                    ch,
+                    [],
+                    [],
+                    downloads,
+                    300.0,
+                    lg,
+                    lg,
+                    download_timeout=dl_sec,
+                    cancel_event=self.ft_transfer_cancel_event,
+                )
+            finally:
+                self._ft_end_transfer_ops()
+            self.root.after(0, lambda tt=tag, ook=ok, ddet=det: self._ft_log(f"{tt} {'OK' if ook else 'FAILED: ' + str(ddet)}"))
+            if ok:
+                self.root.after(0, self._ft_refresh_local_list)
+            if getattr(ch, "closed", False):
+                lk2 = self._ft_lock_for(iid)
+                with lk2:
+                    if self.ft_sessions.get(iid) is ch:
+                        self.ft_sessions.pop(iid, None)
+                self._ft_set_conn_status(iid, "Disconnected")
+        finally:
+            self.root.after(0, lambda: self._ft_set_busy(False))
 
     def run(self):
         """Start the GUI application."""
