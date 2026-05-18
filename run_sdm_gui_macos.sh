@@ -2,6 +2,8 @@
 # Launch sdm_manager_gui.py with a Python that has a working Tcl/Tk on macOS.
 # /usr/bin/python3 (Xcode CLT) often crashes with:
 #   macOS 26 (...) or later required, have instead 16 (...) !
+python3 -m venv .venv
+source .venv/bin/activate
 set -euo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
 GUI="$DIR/sdm_manager_gui.py"

@@ -182,5 +182,66 @@ class TestDevicePromptLineRegex(unittest.TestCase):
         self.assertIsNotNone(r.search(buf))
 
 
+class TestBatchedUploadHeredocLines(unittest.TestCase):
+    def test_empty(self):
+        self.assertEqual(sshcommand._batched_upload_heredoc_lines([]), [])
+
+    def test_reconstructs_one_line(self):
+        lines = ["YWJj"]
+        batches = sshcommand._batched_upload_heredoc_lines(lines)
+        self.assertEqual(len(batches), 1)
+        self.assertEqual(batches[0], "YWJj\n")
+
+    def test_reconstructs_many_mime_width_lines(self):
+        lines = [f"{i:076d}" for i in range(500)]
+        merged = "".join(sshcommand._batched_upload_heredoc_lines(lines))
+        self.assertEqual(merged, "\n".join(lines) + "\n")
+
+    def test_batches_respect_size_cap(self):
+        lines = ["x" * 76 for _ in range(400)]
+        batches = sshcommand._batched_upload_heredoc_lines(lines)
+        self.assertGreater(len(batches), 1)
+        for b in batches:
+            self.assertTrue(b.endswith("\n"), msg=b[-20:])
+            # default cap 8192; MIME lines are 76 so a batch stays bounded
+            self.assertLessEqual(len(b), 8200)
+
+
+class TestUploadHeredocBashRoundTrip(unittest.TestCase):
+    """Decode path matches BusyBox/bash heredoc + base64 -d (no SDM hardware)."""
+
+    def test_batched_body_decodes(self):
+        import base64
+        import hashlib
+        import os
+        import shlex
+        import subprocess
+        import tempfile
+
+        data = os.urandom(42_294)
+        b64 = base64.b64encode(data).decode("ascii")
+        chunks = [b64[i : i + 76] for i in range(0, len(b64), 76)]
+        with tempfile.NamedTemporaryFile(delete=False) as tf:
+            dst = tf.name
+        try:
+            quoted = shlex.quote(dst)
+            pieces = [f"base64 -d > {quoted} <<'__UPLOAD_B64EOF__'\n"]
+            pieces.extend(sshcommand._batched_upload_heredoc_lines(chunks))
+            pieces.append("__UPLOAD_B64EOF__\n")
+            r = subprocess.run(
+                ["bash", "--norc", "-"],
+                input="".join(pieces),
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+            self.assertEqual(r.returncode, 0, msg=(r.stderr or "") + (r.stdout or ""))
+            got = Path(dst).read_bytes()
+            self.assertEqual(hashlib.md5(got).digest(), hashlib.md5(data).digest())
+        finally:
+            Path(dst).unlink(missing_ok=True)
+
+
 if __name__ == "__main__":
     unittest.main()

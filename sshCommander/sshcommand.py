@@ -96,35 +96,74 @@ def _strip_ansi(s: str) -> str:
     return _ANSI_STRIP_RE.sub("", s)
 
 
+def _expect_until_interruptible(
+    child: Any,
+    patterns: list,
+    total_timeout: float,
+    cancel_event: Any,
+) -> tuple[str, Optional[int]]:
+    """
+    Poll ``expect`` with short timeouts until one of ``patterns`` matches, the
+    overall deadline passes, or ``cancel_event`` is set.
+
+    ``patterns`` must not include ``pexpect.TIMEOUT``; it is appended for polling.
+
+    Returns ``("match", index)``, ``("timeout", None)``, or ``("cancelled", None)``.
+    """
+    deadline = time.monotonic() + total_timeout
+    poll_patterns = list(patterns) + [pexpect.TIMEOUT]
+    timeout_pat_idx = len(patterns)
+    while time.monotonic() < deadline:
+        if cancel_event is not None and cancel_event.is_set():
+            return "cancelled", None
+        remain = deadline - time.monotonic()
+        slice_t = min(0.5, remain)
+        if slice_t <= 0:
+            break
+        child.timeout = max(0.05, slice_t)
+        idx = child.expect(poll_patterns)
+        if idx != timeout_pat_idx:
+            return "match", idx
+    return "timeout", None
+
+
 def _wait_for_shell_prompt(
     child: pexpect.spawn,
     overall_timeout: float,
     log: Callable[[str], None],
     phase: str,
+    cancel_event: Any = None,
 ) -> tuple[bool, str]:
     """
     Wait until a device shell prompt matches (strict or loose regex).
 
-    Uses one ``expect`` for the full budget so intermediate banner patterns cannot
-    starve the prompt matcher (handoff regexes were removed for that reason).
+    Uses short polling expects so a ``threading.Event`` can abort promptly
+    (e.g. GUI disconnect while connecting).
     """
     remain = max(0.5, overall_timeout)
-    child.timeout = remain
     log(
         f"milestone: {phase} waiting up to {overall_timeout}s for shell prompt "
-        f"(root@...# or SERIAL:/...#; ANSI + Ctrl+C after # allowed) -- single expect..."
+        f"(root@...# or SERIAL:/...#; ANSI + Ctrl+C after # allowed)..."
     )
-    idx = child.expect(
-        [PATTERN_DEVICE_PROMPT_LINE, PATTERN_DEVICE_PROMPT_LOOSE, pexpect.EOF, pexpect.TIMEOUT],
-        timeout=remain,
+    outcome, idx = _expect_until_interruptible(
+        child,
+        [
+            PATTERN_DEVICE_PROMPT_LINE,
+            PATTERN_DEVICE_PROMPT_LOOSE,
+            pexpect.EOF,
+        ],
+        remain,
+        cancel_event,
     )
-    if idx in (0, 1):
-        return True, ""
+    if outcome == "cancelled":
+        return False, f"{phase}: cancelled"
+    if outcome == "timeout":
+        tail = repr((child.before or "")[-4000:])
+        return False, f"{phase}: timeout after {overall_timeout}s waiting for shell prompt; tail={tail}"
     if idx == 2:
         tail = repr((child.before or "")[-4000:])
         return False, f"{phase}: unexpected EOF; tail={tail}"
-    tail = repr((child.before or "")[-4000:])
-    return False, f"{phase}: timeout after {overall_timeout}s waiting for shell prompt; tail={tail}"
+    return True, ""
 
 
 _B64_LINE_RE = re.compile(r"^[A-Za-z0-9+/]+=*\s*$")
@@ -132,6 +171,34 @@ _B64_LINE_RE = re.compile(r"^[A-Za-z0-9+/]+=*\s*$")
 # Markers for delimiter-based download capture (underscore not in base64 alphabet).
 _B64_MARK_BEGIN = "__SDM_B64_B__"
 _B64_MARK_END = "__SDM_B64_E__"
+
+# Bound PTY write size for base64 heredoc lines (MIME width 76); larger batches cut syscalls.
+_UPLOAD_HEREDOC_BATCH_BYTES = 8192
+
+
+def _batched_upload_heredoc_lines(lines: list[str]) -> list[str]:
+    """
+    Split ``lines`` into newline-terminated strings for ``child.send``, each
+    batch roughly capped by ``_UPLOAD_HEREDOC_BATCH_BYTES`` when joined (a
+    single line longer than that limit is sent alone).
+    """
+    if not lines:
+        return []
+    out: list[str] = []
+    buf: list[str] = []
+    joined_len = 0
+    for line in lines:
+        extra = 1 if buf else 0
+        if buf and joined_len + extra + len(line) > _UPLOAD_HEREDOC_BATCH_BYTES:
+            out.append("\n".join(buf) + "\n")
+            buf = []
+            joined_len = 0
+            extra = 0
+        buf.append(line)
+        joined_len += extra + len(line)
+    if buf:
+        out.append("\n".join(buf) + "\n")
+    return out
 
 
 def _extract_between_markers(text: str, begin: str, end: str) -> str:
@@ -506,9 +573,17 @@ def _do_upload(
         f" ({len(data)} bytes, {len(chunks)} base64 lines)"
     )
     child.sendline(f"base64 -d > {quoted_dst} <<'__UPLOAD_B64EOF__'")
-    for chunk in chunks:
-        child.sendline(chunk)
-    child.sendline("__UPLOAD_B64EOF__")
+    had_delay = hasattr(child, "delaybeforesend")
+    prev_delay = child.delaybeforesend if had_delay else None
+    try:
+        if had_delay:
+            child.delaybeforesend = 0
+        for block in _batched_upload_heredoc_lines(chunks):
+            child.send(block)
+        child.sendline("__UPLOAD_B64EOF__")
+    finally:
+        if had_delay:
+            child.delaybeforesend = prev_delay
     idx = child.expect(
         [PATTERN_DEVICE_PROMPT_LINE, PATTERN_DEVICE_PROMPT_LOOSE, pexpect.EOF, pexpect.TIMEOUT],
         timeout=command_timeout,
@@ -696,12 +771,16 @@ def attach_device_shell(
     command_timeout: float,
     log: Callable[[str], None],
     debug_pty: bool = False,
+    cancel_event: Any = None,
 ) -> tuple[Optional[Any], str]:
     """
     Spawn SSH to jump host, enter ``sdm_port``, wait until device shell is ready.
 
     Returns ``(child, "")`` on success; ``(None, error_detail)`` on failure.
     Caller must ``detach_device_shell`` when done (or close the child).
+
+    If ``cancel_event`` is set while waiting, closes the child and returns
+    ``(None, "cancelled")``.
     """
     child = pexpect.spawn(
         ssh_cmd[0],
@@ -713,26 +792,61 @@ def attach_device_shell(
     if debug_pty:
         child.logfile_read = sys.stderr
     try:
+        if cancel_event is not None and cancel_event.is_set():
+            try:
+                child.close(force=True)
+            except Exception:
+                pass
+            return None, "cancelled"
+
         log("milestone: waiting for jump host port menu (Enter port number)...")
-        idx = child.expect([PATTERN_PORT_PROMPT, pexpect.EOF, pexpect.TIMEOUT])
-        if idx != 0:
+        outcome, idx = _expect_until_interruptible(
+            child,
+            [PATTERN_PORT_PROMPT, pexpect.EOF],
+            connect_timeout,
+            cancel_event,
+        )
+        if outcome == "cancelled":
+            try:
+                child.close(force=True)
+            except Exception:
+                pass
+            return None, "cancelled"
+        if outcome == "timeout":
             rest = (child.before or "") + (child.after or "")
-            return None, f"milestone=port_prompt: did not see port prompt (expect index {idx}): {rest[-500:]}"
+            return None, f"milestone=port_prompt: timeout waiting for port prompt: {rest[-500:]}"
+        if idx == 1:
+            rest = (child.before or "") + (child.after or "")
+            return None, f"milestone=port_prompt: unexpected EOF (expect index {idx}): {rest[-500:]}"
 
         log(f"milestone: sending SDM tunnel port {sdm_port}")
         child.sendline(str(sdm_port))
         time.sleep(0.25)
         ok_prompt, err = _wait_for_shell_prompt(
-            child, connect_timeout, log, phase="device_shell"
+            child, connect_timeout, log, phase="device_shell", cancel_event=cancel_event
         )
         if not ok_prompt:
+            try:
+                child.close(force=True)
+            except Exception:
+                pass
+            if err.endswith("cancelled") or "cancelled" in err:
+                return None, "cancelled"
             return None, f"milestone=device_shell: {err}"
 
-        while child.expect(
-            [PATTERN_DEVICE_PROMPT_LINE, PATTERN_DEVICE_PROMPT_LOOSE, pexpect.TIMEOUT],
-            timeout=0.5,
-        ) in (0, 1):
-            pass
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                try:
+                    child.close(force=True)
+                except Exception:
+                    pass
+                return None, "cancelled"
+            idx2 = child.expect(
+                [PATTERN_DEVICE_PROMPT_LINE, PATTERN_DEVICE_PROMPT_LOOSE, pexpect.TIMEOUT],
+                timeout=0.5,
+            )
+            if idx2 not in (0, 1):
+                break
 
         log("milestone: device shell ready")
         child.timeout = command_timeout
@@ -743,6 +857,43 @@ def attach_device_shell(
         except Exception:
             pass
         return None, f"milestone=attach: {exc}"
+
+
+def ping_open_device_shell(
+    child: Any,
+    log: Callable[[str], None],
+    overall_timeout: float = 12.0,
+    cancel_event: Any = None,
+) -> tuple[bool, str]:
+    """
+    Send a trivial echo and wait for the device prompt again.
+
+    Catches shells that looked ready but immediately drop or never echo a prompt
+    after a command.
+    """
+    if child is None:
+        return False, "ping: no child"
+    try:
+        if getattr(child, "closed", False):
+            return False, "ping: closed"
+    except Exception:
+        pass
+    try:
+        if hasattr(child, "isalive") and not child.isalive():
+            return False, "ping: not alive"
+    except Exception:
+        pass
+    log("milestone: ping shell (echo)")
+    try:
+        child.sendline("echo __SDM_FT_PING__")
+    except Exception as exc:
+        return False, f"ping: send: {exc}"
+    ok, err = _wait_for_shell_prompt(
+        child, overall_timeout, log, phase="ping", cancel_event=cancel_event
+    )
+    if not ok:
+        return False, err or "ping: no prompt"
+    return True, ""
 
 
 def run_ops_on_open_shell(

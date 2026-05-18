@@ -10,7 +10,9 @@ import shlex
 import ssl
 import sys
 import tempfile
+import time
 import threading
+import uuid
 from pathlib import Path
 
 try:
@@ -34,6 +36,11 @@ except ImportError as e:
 from dataclasses import replace
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple
+
+# File transfer tab: default jump host (SMB Shells).
+FT_DEFAULT_JUMP_SSH_URL = "vvdn@smbshells.netgear.com"
+# Cap failure lines in batch dialogs so the UI stays responsive with huge batches.
+_FT_FAILURE_DIALOG_MAX_LINES = 200
 
 try:
     import aiohttp
@@ -468,8 +475,8 @@ class InsightCloudAPI:
             clean_token = token.split("accessToken=")[1].split(";")[0]
         
         headers = {
-            "apikey": self.config.API_KEY,  # lowercase to match working curl
-            "accountid": account_id,        # lowercase to match working curl
+            "apiKey": self.config.API_KEY,     
+            "accountId": account_id,      
             "token": clean_token,
             "content-type": "application/json",
             "accept": "application/json, text/plain, */*",
@@ -876,7 +883,9 @@ class SDMManagerGUI:
 
         # Log tab
         self.setup_log_tab()
-        
+
+        self.notebook.bind("<<NotebookTabChanged>>", self._ft_on_notebook_tab_change)
+
     def setup_auth_tab(self):
         """Setup authentication tab with modern design."""
         auth_frame = ttk.Frame(self.notebook)
@@ -1473,6 +1482,10 @@ This method works with your existing authentication!"""
         
     def on_org_selected(self, event):
         """Handle organization selection."""
+        if hasattr(self, "_ft_disconnect_all"):
+            self._ft_disconnect_all()
+        if hasattr(self, "_ft_on_network_context_change"):
+            self._ft_on_network_context_change()
         self.loc_combo.set("")
         self.loc_combo['values'] = []
         # Clear device list and selections
@@ -1537,6 +1550,10 @@ This method works with your existing authentication!"""
         
     def on_location_selected(self, event):
         """Handle location selection."""
+        if hasattr(self, "_ft_disconnect_all"):
+            self._ft_disconnect_all()
+        if hasattr(self, "_ft_on_network_context_change"):
+            self._ft_on_network_context_change()
         # Clear device list and selections
         for item in self.device_tree.get_children():
             self.device_tree.delete(item)
@@ -1551,7 +1568,12 @@ This method works with your existing authentication!"""
         """Load AP devices for selected location."""
         if not self.auth_response or not self.loc_combo.get():
             return
-            
+
+        if hasattr(self, "_ft_disconnect_all"):
+            self._ft_disconnect_all()
+        if hasattr(self, "_ft_on_network_context_change"):
+            self._ft_on_network_context_change()
+
         selected_index = self.loc_combo.current()
         if selected_index < 0:
             return
@@ -1622,7 +1644,10 @@ This method works with your existing authentication!"""
         self.share_diagnostics_button.config(state="normal")
         
         self.log(f"✅ Loaded {len(self.ap_devices)} AP devices")
-        
+
+        if hasattr(self, "_ft_refresh_inventory_from_insight"):
+            self._ft_refresh_inventory_from_insight(force=False)
+
     def on_device_selected(self, event):
         """Handle device selection and update details panel."""
         selection = self.device_tree.selection()
@@ -2369,6 +2394,226 @@ Current Environment: {self.config.ENVIRONMENT_NAME}"""
                 self.device_tree.item(item_id, values=values)
                 break
 
+    def _ft_on_notebook_tab_change(self, event: tk.Event) -> None:
+        try:
+            if str(self.notebook.select()) != str(self.ft_tab):
+                return
+        except Exception:
+            return
+        if getattr(self, "ft_csv_path", None):
+            return
+        if hasattr(self, "_ft_refresh_inventory_from_insight"):
+            self._ft_refresh_inventory_from_insight(force=False)
+
+    def _ft_clear_csv_for_insight(self) -> None:
+        self.ft_csv_path = None
+        if hasattr(self, "ft_manual_rows"):
+            self.ft_manual_rows.clear()
+        self._ft_disconnect_all()
+        self._ft_refresh_inventory_from_insight(force=True)
+        self._ft_update_summary()
+        self._ft_log("CSV cleared; using Insight device list when available.")
+
+    def _ft_show_failures_dialog(self, title: str, lines: List[str]) -> None:
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        win.transient(self.root)
+        win.grab_set()
+        txt = scrolledtext.ScrolledText(win, width=96, height=22, wrap=tk.WORD)
+        txt.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        cap = _FT_FAILURE_DIALOG_MAX_LINES
+        if len(lines) > cap:
+            head = lines[:cap]
+            body = "\n".join(head)
+            body += f"\n\n… ({len(lines) - cap} more line(s) omitted; see transfer log.)"
+        else:
+            body = "\n".join(lines) if lines else "(no detail lines)"
+        txt.insert(tk.END, body)
+        txt.config(state=tk.DISABLED)
+        ttk.Button(win, text="Close", command=win.destroy).pack(pady=8)
+
+    def _ft_reset_download_progress(self) -> None:
+        if not hasattr(self, "ft_progress_bar"):
+            return
+
+        def _apply() -> None:
+            self.ft_progress_bar.config(mode="determinate", maximum=100, value=0)
+            self.ft_progress_label.config(text="")
+
+        self.root.after(0, _apply)
+
+    def _ft_set_download_progress(self, cur: int, total: int, msg: str) -> None:
+        def _apply() -> None:
+            if not hasattr(self, "ft_progress_bar"):
+                return
+            mx = max(int(total), 1)
+            self.ft_progress_bar.config(mode="determinate", maximum=mx, value=min(int(cur), mx))
+            self.ft_progress_label.config(text=msg)
+
+        self.root.after(0, _apply)
+
+    def _ft_insight_inventory_key(self) -> Optional[str]:
+        if getattr(self, "ft_csv_path", None):
+            return None
+        loc = getattr(self, "selected_location", None)
+        devs = getattr(self, "ap_devices", None)
+        if loc is None or devs is None:
+            return None
+        parts: List[tuple] = []
+        for d in devs:
+            parts.append(
+                (
+                    getattr(d, "serialNo", "") or "",
+                    getattr(d, "deviceId", "") or "",
+                    d.name or "",
+                    str(d.sdmPort) if d.sdmPort is not None else "",
+                    str(getattr(d, "sdmStatus", "")),
+                )
+            )
+        parts.sort()
+        nid = str(getattr(loc, "networkId", "") or "")
+        return f"{nid}\x1e{json.dumps(parts, separators=(',', ':'))}"
+
+    def _ft_invalidate_insight_snapshot(self) -> None:
+        self._ft_last_insight_inventory_key = None
+
+    def _ft_on_network_context_change(self) -> None:
+        self._ft_invalidate_insight_snapshot()
+        if not hasattr(self, "ft_manual_rows"):
+            return
+        self.ft_manual_rows.clear()
+        if getattr(self, "ft_csv_path", None):
+            return
+        if not hasattr(self, "ft_inventory"):
+            return
+        for e in list(self.ft_inventory):
+            if e.get("manual") and self.ft_tree.exists(e["iid"]):
+                self.ft_tree.delete(e["iid"])
+        self.ft_inventory = [e for e in self.ft_inventory if not e.get("manual")]
+        self._ft_update_inventory_status_message()
+        self._ft_sync_run_button_state()
+
+    def _ft_display_name(self, raw: Dict[str, str]) -> str:
+        n = (raw.get("Name") or "").strip()
+        return n if n else "(unnamed)"
+
+    def _ft_update_inventory_status_message(self) -> None:
+        if getattr(self, "ft_csv_path", None):
+            return
+        if not hasattr(self, "ft_inventory"):
+            return
+        n_ins = sum(1 for e in self.ft_inventory if not e.get("manual"))
+        n_man = sum(1 for e in self.ft_inventory if e.get("manual"))
+        n_elig = sum(1 for e in self.ft_inventory if e["eligible"])
+        if not getattr(self, "auth_response", None):
+            msg = (
+                "Authenticate to load Insight APs. You can use Add port for manual jump sessions "
+                "or browse a CSV (SDM Port column required)."
+            )
+        elif not getattr(self, "ap_devices", None):
+            msg = f"Manual rows: {n_man}; selectable (valid SDM port)={n_elig}. Load APs for the Insight list."
+        else:
+            msg = f"Insight: {n_ins} AP(s), manual={n_man}, selectable (valid SDM port)={n_elig}."
+        self.ft_csv_label_var.set(msg)
+
+    def _ft_insert_manual_row_live(self, sc: Any, iid: str, raw: Dict[str, str]) -> None:
+        port_ok = sc.is_valid_sdm_port((raw.get("SDM Port") or "")) is not None
+        eligible = port_ok
+        self.ft_inventory.append({"iid": iid, "raw": raw, "eligible": eligible, "manual": True})
+        dn = self._ft_display_name(raw)
+        self.ft_tree.insert(
+            "",
+            tk.END,
+            iid=iid,
+            values=(
+                "☐",
+                dn,
+                raw.get("IP", "") or "",
+                raw.get("Model", "") or "",
+                raw.get("SDM Status", "") or "",
+                raw.get("SDM Port", "") or "",
+                "—" if not eligible else "Disconnected",
+            ),
+        )
+        self._ft_update_inventory_status_message()
+        self._ft_sync_run_button_state()
+
+    def _ft_refresh_inventory_from_insight(self, force: bool = False) -> None:
+        """Rebuild File transfer tree from Insight API devices when no CSV is active."""
+        if getattr(self, "ft_csv_path", None):
+            return
+        key = self._ft_insight_inventory_key()
+        last = getattr(self, "_ft_last_insight_inventory_key", None)
+        if not force and key is not None and last == key:
+            return
+        try:
+            sc = self._ft_import_sshcommand()
+        except Exception as exc:
+            self.ft_csv_label_var.set(f"Could not load sshcommand: {exc}")
+            return
+
+        self.ft_csv_fieldnames = ["Name", "SDM Port", "SDM Status", "IP", "Model"]
+        for it in self.ft_tree.get_children():
+            self.ft_tree.delete(it)
+        self.ft_inventory = []
+
+        if getattr(self, "auth_response", None) and getattr(self, "ap_devices", None):
+            for i, device in enumerate(self.ap_devices):
+                port_str = "" if device.sdmPort is None else str(device.sdmPort)
+                sdm_st = "Enabled" if str(device.sdmStatus) == "1" else "Disabled"
+                port_ok = sc.is_valid_sdm_port(port_str) is not None
+                eligible = port_ok
+                raw: Dict[str, str] = {
+                    "Name": device.name or "",
+                    "SDM Port": port_str,
+                    "SDM Status": sdm_st,
+                    "IP": device.ipAddress or "",
+                    "Model": device.model or "",
+                }
+                iid = str(i)
+                self.ft_inventory.append({"iid": iid, "raw": raw, "eligible": eligible, "manual": False})
+                dn = self._ft_display_name(raw)
+                self.ft_tree.insert(
+                    "",
+                    tk.END,
+                    iid=iid,
+                    values=(
+                        "☐",
+                        dn,
+                        raw["IP"],
+                        raw["Model"],
+                        raw["SDM Status"],
+                        raw["SDM Port"],
+                        "—" if not eligible else "Disconnected",
+                    ),
+                )
+
+        for m in list(getattr(self, "ft_manual_rows", [])):
+            iid_m = m["iid"]
+            raw_m = dict(m["raw"])
+            port_ok = sc.is_valid_sdm_port((raw_m.get("SDM Port") or "")) is not None
+            eligible = port_ok
+            self.ft_inventory.append({"iid": iid_m, "raw": raw_m, "eligible": eligible, "manual": True})
+            dn = self._ft_display_name(raw_m)
+            self.ft_tree.insert(
+                "",
+                tk.END,
+                iid=iid_m,
+                values=(
+                    "☐",
+                    dn,
+                    raw_m.get("IP", "") or "",
+                    raw_m.get("Model", "") or "",
+                    raw_m.get("SDM Status", "") or "",
+                    raw_m.get("SDM Port", "") or "",
+                    "—" if not eligible else "Disconnected",
+                ),
+            )
+
+        self._ft_last_insight_inventory_key = key
+        self._ft_update_inventory_status_message()
+        self._ft_sync_run_button_state()
+
     def _ft_import_sshcommand(self):
         """Load sshCommander/sshcommand.py as ``sshcommand``."""
         root = Path(__file__).resolve().parent / "sshCommander"
@@ -2383,10 +2628,13 @@ Current Environment: {self.config.ENVIRONMENT_NAME}"""
         """Tab: CSV AP pick, batch or single-AP explorer upload/download via sshcommand."""
         tab = ttk.Frame(self.notebook)
         self.notebook.add(tab, text="📁 File transfer")
+        self.ft_tab = tab
 
         self.ft_csv_path: Optional[Path] = None
         self.ft_csv_fieldnames: List[str] = []
         self.ft_inventory: List[Dict[str, Any]] = []
+        self.ft_manual_rows: List[Dict[str, Any]] = []
+        self._ft_last_insight_inventory_key: Optional[str] = None
         self.ft_batch_upload_paths: List[Path] = []
         self.ft_local_cwd = Path.home().resolve()
         self.ft_busy = False
@@ -2427,30 +2675,21 @@ Current Environment: {self.config.ENVIRONMENT_NAME}"""
 
         self.ft_tab_canvas = ft_canvas
 
-        outer = ttk.PanedWindow(ft_inner, orient=tk.HORIZONTAL)
-        outer.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        self.ft_main_col = ttk.Frame(ft_inner)
+        self.ft_main_col.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-        left = ttk.Frame(outer)
-        right = ttk.LabelFrame(outer, text=" Summary ", padding=12)
-        outer.add(left, weight=4)
-        outer.add(right, weight=1)
-
-        left_v = ttk.PanedWindow(left, orient=tk.VERTICAL)
-        left_v.pack(fill=tk.BOTH, expand=True)
-        top_area = ttk.Frame(left_v)
-        mid_log = ttk.PanedWindow(left_v, orient=tk.VERTICAL)
-        left_v.add(top_area, weight=2)
-        left_v.add(mid_log, weight=3)
+        top_area = ttk.Frame(self.ft_main_col)
+        top_area.pack(fill=tk.BOTH, expand=True)
 
         jump = ttk.LabelFrame(top_area, text=" Jump host (SMB Shells) ", padding=10)
         jump.pack(fill=tk.X, pady=(0, 8))
         ttk.Label(
             jump,
-            text="Uses sshcommand with --require-sdm-enabled and --accept-new-host-key (always on).",
+            text="Uses sshcommand with --accept-new-host-key (always on). Batches use rows with a valid SDM port (SDM does not need to show Enabled).",
             wraplength=720,
         ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
 
-        self.ft_url_var = tk.StringVar()
+        self.ft_url_var = tk.StringVar(value=FT_DEFAULT_JUMP_SSH_URL)
         self.ft_rsa_var = tk.StringVar()
         self.ft_ssh_port_var = tk.StringVar(value="443")
         ttk.Label(jump, text="SSH URL (user@host):").grid(row=1, column=0, sticky="w", pady=2)
@@ -2462,27 +2701,61 @@ Current Environment: {self.config.ENVIRONMENT_NAME}"""
         ttk.Entry(jump, textvariable=self.ft_ssh_port_var, width=8).grid(row=3, column=1, sticky="w", padx=6)
         jump.columnconfigure(1, weight=1)
 
-        csv_frame = ttk.LabelFrame(top_area, text=" 1. Inventory CSV ", padding=10)
+        rel = ttk.LabelFrame(top_area, text=" Connection reliability (serial) ", padding=8)
+        rel.pack(fill=tk.X, pady=(0, 8))
+        r1 = ttk.Frame(rel)
+        r1.pack(fill=tk.X)
+        self.ft_rel_extra_retries_var = tk.StringVar(value="2")
+        self.ft_rel_backoff_var = tk.StringVar(value="0.5")
+        self.ft_rel_pause_connect_var = tk.StringVar(value="0.2")
+        self.ft_rel_pause_batch_var = tk.StringVar(value="0.15")
+        ttk.Label(r1, text="Extra connect retries:").pack(side=tk.LEFT)
+        ttk.Entry(r1, textvariable=self.ft_rel_extra_retries_var, width=4).pack(side=tk.LEFT, padx=(4, 12))
+        ttk.Label(r1, text="Backoff base (s):").pack(side=tk.LEFT)
+        ttk.Entry(r1, textvariable=self.ft_rel_backoff_var, width=6).pack(side=tk.LEFT, padx=(4, 12))
+        ttk.Label(r1, text="Pause after connect (s):").pack(side=tk.LEFT)
+        ttk.Entry(r1, textvariable=self.ft_rel_pause_connect_var, width=6).pack(side=tk.LEFT, padx=(4, 12))
+        ttk.Label(r1, text="Pause between batch APs (s):").pack(side=tk.LEFT)
+        ttk.Entry(r1, textvariable=self.ft_rel_pause_batch_var, width=6).pack(side=tk.LEFT, padx=(4, 0))
+        r2 = ttk.Frame(rel)
+        r2.pack(fill=tk.X, pady=(6, 0))
+        self.ft_rel_ping_var = tk.BooleanVar(value=False)
+        self.ft_rel_batch_reconnect_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(r2, text="Ping shell after connect", variable=self.ft_rel_ping_var).pack(
+            side=tk.LEFT, padx=(0, 16)
+        )
+        ttk.Checkbutton(
+            r2,
+            text="Reconnect if session dead before batch",
+            variable=self.ft_rel_batch_reconnect_var,
+        ).pack(side=tk.LEFT)
+
+        csv_frame = ttk.LabelFrame(top_area, text=" 1. Inventory (CSV or Insight) ", padding=10)
         csv_frame.pack(fill=tk.X, pady=(0, 8))
         self.ft_csv_label_var = tk.StringVar(value="No CSV loaded")
-        ttk.Button(csv_frame, text="Browse CSV…", command=self._ft_browse_csv).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Label(csv_frame, textvariable=self.ft_csv_label_var, wraplength=600).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        csv_btn_row = ttk.Frame(csv_frame)
+        csv_btn_row.pack(fill=tk.X, pady=(0, 4))
+        ttk.Button(csv_btn_row, text="Browse CSV…", command=self._ft_browse_csv).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(csv_btn_row, text="Clear CSV", command=self._ft_clear_csv_for_insight).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(csv_frame, textvariable=self.ft_csv_label_var, wraplength=720).pack(fill=tk.X, anchor=tk.W)
         ttk.Label(
             csv_frame,
-            text="Requires columns Name and SDM Port (Insight export). Only SDM Status=Enabled rows can be selected.",
+            text="CSV must include SDM Port (Name optional; added if missing). Without CSV, the list follows Device Management when APs are loaded; use Add port for a jump session by port only.",
             wraplength=720,
             foreground="#555",
         ).pack(fill=tk.X, pady=(8, 0))
 
         ap_frame = ttk.LabelFrame(top_area, text=" 2. Select APs ", padding=10)
-        ap_frame.pack(fill=tk.BOTH, expand=False, pady=(0, 8))
+        ap_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
         tb = ttk.Frame(ap_frame)
         tb.pack(fill=tk.X, pady=(0, 6))
-        ttk.Button(tb, text="Select all (eligible)", command=self._ft_check_all).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(tb, text="Select all (valid port)", command=self._ft_check_all).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(tb, text="Clear selection", command=self._ft_check_none).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(tb, text="Add port…", command=self._ft_add_manual_port_clicked).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(tb, text="Remove", command=self._ft_remove_manual_port_clicked).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(tb, text="Connect", command=self._ft_connect_clicked).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(tb, text="Disconnect", command=self._ft_disconnect_all).pack(side=tk.LEFT)
-        self.ft_sel_count_var = tk.StringVar(value="Selected eligible APs: 0")
+        self.ft_sel_count_var = tk.StringVar(value="Selected APs (valid port): 0")
         ttk.Label(tb, textvariable=self.ft_sel_count_var).pack(side=tk.RIGHT)
 
         tree_wrap = ttk.Frame(ap_frame)
@@ -2518,9 +2791,7 @@ Current Environment: {self.config.ENVIRONMENT_NAME}"""
         self.ft_download_timeout_var = tk.StringVar(value="900")
         ttk.Entry(to_row, textvariable=self.ft_download_timeout_var, width=10).pack(side=tk.LEFT, padx=6)
 
-        ft_mid = ttk.Frame(mid_log)
-        mid_log.add(ft_mid, weight=4)
-        self.ft_body = ttk.Frame(ft_mid)
+        self.ft_body = ttk.Frame(self.ft_main_col)
         self.ft_body.pack(fill=tk.BOTH, expand=True)
 
         self.ft_batch_frame = ttk.LabelFrame(self.ft_body, text=" Batch (multiple APs) ", padding=10)
@@ -2613,26 +2884,33 @@ Current Environment: {self.config.ENVIRONMENT_NAME}"""
 
         self.ft_explorer_frame.pack_forget()
 
-        log_fr = ttk.LabelFrame(mid_log, text=" Transfer log ", padding=8)
-        mid_log.add(log_fr, weight=2)
+        log_fr = ttk.LabelFrame(self.ft_main_col, text=" Transfer log ", padding=8)
+        log_fr.pack(fill=tk.BOTH, expand=True)
         self.ft_log_text = scrolledtext.ScrolledText(log_fr, height=8, wrap=tk.WORD)
         self.ft_log_text.pack(fill=tk.BOTH, expand=True)
         ttk.Button(log_fr, text="Clear log", command=self._ft_clear_log).pack(anchor=tk.E, pady=(4, 0))
 
-        self.ft_summary_text = tk.Text(right, height=22, width=36, wrap=tk.WORD, state=tk.DISABLED)
-        self.ft_summary_text.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+        self.ft_actions = ttk.LabelFrame(self.ft_main_col, text=" Transfer actions ", padding=8)
+        self.ft_actions.pack(fill=tk.X, pady=(8, 0))
+        act_row = ttk.Frame(self.ft_actions)
+        act_row.pack(fill=tk.X)
+        self.ft_run_btn = ttk.Button(act_row, text="Run transfer", command=self._ft_run_transfer, style="Primary.TButton")
+        self.ft_run_btn.pack(side=tk.LEFT, padx=(0, 8))
+        self.ft_stop_btn = ttk.Button(act_row, text="Stop transfer", command=self._ft_stop_transfer, state=tk.DISABLED)
+        self.ft_stop_btn.pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(act_row, text="Clear form", command=self._ft_clear_form).pack(side=tk.LEFT)
+        prog_row = ttk.Frame(self.ft_actions)
+        prog_row.pack(fill=tk.X, pady=(8, 0))
+        self.ft_progress_label = ttk.Label(prog_row, text="")
+        self.ft_progress_label.pack(anchor=tk.W)
+        self.ft_progress_bar = ttk.Progressbar(prog_row, mode="determinate", maximum=100, value=0)
+        self.ft_progress_bar.pack(fill=tk.X, pady=(4, 0))
 
-        act = ttk.Frame(right)
-        act.pack(fill=tk.X)
-        self.ft_run_btn = ttk.Button(act, text="Run transfer", command=self._ft_run_transfer, style="Primary.TButton")
-        self.ft_run_btn.pack(fill=tk.X, pady=(0, 6))
-        self.ft_stop_btn = ttk.Button(act, text="Stop transfer", command=self._ft_stop_transfer, state=tk.DISABLED)
-        self.ft_stop_btn.pack(fill=tk.X, pady=(0, 6))
-        ttk.Button(act, text="Clear form", command=self._ft_clear_form).pack(fill=tk.X)
         self.ft_action_widgets.extend([self.ft_run_btn, self.ft_stop_btn, self.ft_remote_refresh_btn, self.ft_explorer_frame])
         self.ft_sessions: Dict[str, Any] = {}
         self.ft_session_locks: Dict[str, threading.Lock] = {}
         self.ft_transfer_cancel_event = threading.Event()
+        self.ft_connect_cancel_event = threading.Event()
         self._ft_transfer_state_lock = threading.Lock()
         self._ft_transfer_active_child: Any = None
         self._ft_transfer_active_iid: Optional[str] = None
@@ -2640,6 +2918,7 @@ Current Environment: {self.config.ENVIRONMENT_NAME}"""
         self._ft_on_mode_change()
         self._ft_update_selection_layout()
         self._ft_sync_run_button_state()
+        self._ft_refresh_inventory_from_insight(force=True)
 
     def _on_app_window_close(self) -> None:
         try:
@@ -2701,8 +2980,128 @@ Current Environment: {self.config.ENVIRONMENT_NAME}"""
         vals[6] = text
         self.ft_tree.item(iid, values=tuple(vals))
 
+    def _ft_parse_rel_int(self, sv: tk.StringVar, default: int, lo: int, hi: int) -> int:
+        try:
+            v = int((sv.get() or "").strip())
+        except ValueError:
+            return default
+        return max(lo, min(hi, v))
+
+    def _ft_parse_rel_seconds(self, sv: tk.StringVar, default: float, lo: float, hi: float) -> float:
+        try:
+            v = float((sv.get() or "").strip())
+        except ValueError:
+            return default
+        return max(lo, min(hi, v))
+
+    def _ft_is_transient_connect_error(self, err: str) -> bool:
+        if not err or err.strip().lower() == "cancelled":
+            return False
+        el = err.lower()
+        if "cancelled" in el:
+            return False
+        needles = (
+            "timeout",
+            "unexpected eof",
+            "milestone=port_prompt",
+            "milestone=device_shell",
+            "milestone=attach",
+            "ping:",
+        )
+        return any(n in el for n in needles)
+
+    def _ft_shell_alive(self, ch: Any) -> bool:
+        if ch is None:
+            return False
+        try:
+            if getattr(ch, "closed", False):
+                return False
+        except Exception:
+            pass
+        try:
+            if hasattr(ch, "isalive") and not ch.isalive():
+                return False
+        except Exception:
+            pass
+        return True
+
+    def _ft_raw_for_iid(self, iid: str) -> Optional[Dict[str, str]]:
+        for ent in self.ft_inventory:
+            if ent["iid"] == iid:
+                return ent["raw"]
+        return None
+
+    def _ft_force_close_child(self, sc: Any, ch: Any) -> None:
+        if ch is None:
+            return
+        try:
+            if sc is not None:
+                sc.detach_device_shell(ch, 45.0, lambda _m: None)
+        except Exception:
+            pass
+        try:
+            ch.close(force=True)
+        except Exception:
+            pass
+
+    def _ft_ensure_batch_channel(
+        self,
+        sc: Any,
+        ssh_cmd: List[str],
+        iid: str,
+        tag: str,
+        failures: List[str],
+        log_cb: Callable[[str], None],
+    ) -> Any:
+        lk = self._ft_lock_for(iid)
+        with lk:
+            ch = self.ft_sessions.get(iid)
+        if self._ft_shell_alive(ch):
+            return ch
+        had = ch is not None
+        if had:
+            with lk:
+                if self.ft_sessions.get(iid) is ch:
+                    self.ft_sessions.pop(iid, None)
+            self._ft_force_close_child(sc, ch)
+        if not self.ft_rel_batch_reconnect_var.get():
+            if not had:
+                failures.append(f"{tag} Connect first (skipped).")
+            else:
+                failures.append(f"{tag} session dead (enable 'Reconnect…' or Connect again).")
+            return None
+        raw = self._ft_raw_for_iid(iid)
+        if raw is None:
+            failures.append(f"{tag} session dead; no table row for reconnect.")
+            return None
+        port = sc.is_valid_sdm_port(raw.get("SDM Port") or "")
+        if port is None:
+            failures.append(f"{tag} session dead; invalid port for reconnect.")
+            return None
+        if self.ft_transfer_cancel_event.is_set():
+            return None
+        log_cb("milestone: reconnecting dead session")
+        child, err = sc.attach_device_shell(
+            ssh_cmd,
+            port,
+            120.0,
+            300.0,
+            log_cb,
+            False,
+            cancel_event=self.ft_transfer_cancel_event,
+        )
+        if child:
+            with lk:
+                self.ft_sessions[iid] = child
+            self._ft_set_conn_status(iid, "Connected")
+            return child
+        failures.append(f"{tag} reconnect failed: {err}")
+        self._ft_set_conn_status(iid, "Error")
+        return None
+
     def _ft_disconnect_all(self) -> None:
         """Close all persistent device shells and reset Connection column."""
+        self.ft_connect_cancel_event.set()
         try:
             sc = self._ft_import_sshcommand()
         except Exception:
@@ -2715,19 +3114,19 @@ Current Environment: {self.config.ENVIRONMENT_NAME}"""
             lk = self._ft_lock_for(iid)
             with lk:
                 ch = self.ft_sessions.pop(iid, None)
-            if ch is not None and sc is not None:
-                try:
+            if ch is None:
+                continue
+            try:
+                if sc is not None:
                     sc.detach_device_shell(ch, 120.0, _lo)
-                except Exception:
-                    try:
-                        ch.close(force=True)
-                    except Exception:
-                        pass
-            elif ch is not None:
-                try:
-                    ch.close(force=True)
-                except Exception:
-                    pass
+            except Exception:
+                pass
+            try:
+                ch.close(force=True)
+            except Exception:
+                pass
+
+        self.ft_sessions.clear()
 
         for ent in self.ft_inventory:
             if self.ft_tree.exists(ent["iid"]):
@@ -2735,9 +3134,11 @@ Current Environment: {self.config.ENVIRONMENT_NAME}"""
                 self._ft_set_conn_status(ent["iid"], st)
 
     def _ft_iid_for_device(self, sc: Any, name: str, port: int) -> Optional[str]:
+        want = (name or "").strip() or "(unnamed)"
         for ent in self.ft_inventory:
             r = ent["raw"]
-            if (r.get("Name") or "") != name:
+            got = (r.get("Name") or "").strip() or "(unnamed)"
+            if got != want:
                 continue
             p = sc.is_valid_sdm_port(r.get("SDM Port") or "")
             if p == port:
@@ -2749,6 +3150,12 @@ Current Environment: {self.config.ENVIRONMENT_NAME}"""
         if len(rows) != 1:
             return None
         r0 = rows[0]
+        try:
+            sc = self._ft_import_sshcommand()
+        except Exception:
+            return None
+        p0 = sc.is_valid_sdm_port(r0.get("SDM Port") or "")
+        n0 = (r0.get("Name") or "").strip() or "(unnamed)"
         for ent in self.ft_inventory:
             if not ent["eligible"]:
                 continue
@@ -2756,7 +3163,9 @@ Current Environment: {self.config.ENVIRONMENT_NAME}"""
             if not vals or vals[0] != "☑":
                 continue
             r = ent["raw"]
-            if r.get("Name") == r0.get("Name") and (r.get("SDM Port") or "") == (r0.get("SDM Port") or ""):
+            p1 = sc.is_valid_sdm_port(r.get("SDM Port") or "")
+            n1 = (r.get("Name") or "").strip() or "(unnamed)"
+            if n1 == n0 and p0 == p1:
                 return ent["iid"]
         return None
 
@@ -2771,8 +3180,9 @@ Current Environment: {self.config.ENVIRONMENT_NAME}"""
             if vals and vals[0] == "☑":
                 targets.append((ent["iid"], ent["raw"]))
         if not targets:
-            messagebox.showwarning("Connect", "Check at least one eligible AP.")
+            messagebox.showwarning("Connect", "Check at least one AP with a valid SDM port.")
             return
+        self.ft_connect_cancel_event.clear()
         threading.Thread(target=self._ft_connect_worker, args=(targets,), daemon=True).start()
 
     def _ft_connect_worker(self, targets: List[Tuple[str, Dict[str, str]]]) -> None:
@@ -2781,34 +3191,160 @@ Current Environment: {self.config.ENVIRONMENT_NAME}"""
         except Exception as e:
             self.root.after(0, lambda err=str(e): self._ft_log(f"Connect failed: {err}"))
             return
-        for iid, raw in targets:
+
+        n_total = len(targets)
+        extra_retries = self._ft_parse_rel_int(self.ft_rel_extra_retries_var, 2, 0, 8)
+        backoff_base = self._ft_parse_rel_seconds(self.ft_rel_backoff_var, 0.5, 0.05, 10.0)
+        pause_ok = self._ft_parse_rel_seconds(self.ft_rel_pause_connect_var, 0.2, 0.0, 5.0)
+        want_ping = self.ft_rel_ping_var.get()
+
+        ok_n = 0
+        fail_n = 0
+        stopped_global = False
+
+        for idx, (iid, raw) in enumerate(targets, start=1):
+            if stopped_global:
+                break
+            if self.ft_connect_cancel_event.is_set():
+                self.root.after(0, lambda: self._ft_log("Connect cancelled (Disconnect)."))
+                break
+
             port = sc.is_valid_sdm_port(raw.get("SDM Port") or "")
             if port is None:
+                fail_n += 1
                 continue
+
+            name_disp = self._ft_display_name(raw)
+            self.root.after(
+                0,
+                lambda i2=idx, nt=n_total, nd=name_disp, prt=port: self._ft_log(
+                    f"Connect AP {i2}/{nt}: {nd} port={prt}"
+                ),
+            )
+
             lock = self._ft_lock_for(iid)
-            try:
-                with lock:
-                    old = self.ft_sessions.pop(iid, None)
-                    if old is not None:
-                        sc.detach_device_shell(old, 120.0, lambda _m: None)
+
+            def mklog(ii: str) -> Callable[[str], None]:
+                return lambda m: self.root.after(0, lambda mm=m, i2=ii: self._ft_log(f"[{i2}] {mm}"))
+
+            lg = mklog(iid)
+            got_connected = False
+            backoff_used = 0.0
+            max_backoff_per_ap = 4.0
+
+            for attempt in range(extra_retries + 1):
+                if self.ft_connect_cancel_event.is_set():
+                    self.root.after(0, lambda: self._ft_log("Connect cancelled (Disconnect)."))
+                    stopped_global = True
+                    break
+
+                remaining_cap = max(0.0, max_backoff_per_ap - backoff_used)
+
+                if attempt > 0:
+                    mx = extra_retries + 1
+                    self.root.after(
+                        0,
+                        lambda a=attempt, mx=mx, ii=iid: self._ft_log(
+                            f"[{ii}] connect retry attempt {a + 1}/{mx}"
+                        ),
+                    )
+
+                old: Any = None
+                try:
+                    with lock:
+                        old = self.ft_sessions.pop(iid, None)
+                        if old is not None:
+                            sc.detach_device_shell(old, 120.0, lambda _m: None)
+                except Exception:
+                    try:
+                        if old is not None:
+                            old.close(force=True)
+                    except Exception:
+                        pass
+
                 self.root.after(0, lambda ii=iid: self._ft_set_conn_status(ii, "Connecting…"))
 
-                def mklog(ii: str) -> Callable[[str], None]:
-                    return lambda m: self.root.after(0, lambda mm=m, i2=ii: self._ft_log(f"[{i2}] {mm}"))
+                err = ""
+                child: Any = None
+                try:
+                    with lock:
+                        child, err = sc.attach_device_shell(
+                            ssh_cmd,
+                            port,
+                            120.0,
+                            300.0,
+                            lg,
+                            False,
+                            cancel_event=self.ft_connect_cancel_event,
+                        )
+                except Exception as e:
+                    err = f"milestone=attach: {e}"
 
-                lg = mklog(iid)
-                with lock:
-                    child, err = sc.attach_device_shell(ssh_cmd, port, 120.0, 300.0, lg, False)
-                    if child:
+                if err == "cancelled" or (not child and err and "cancelled" in err.lower()):
+                    with lock:
+                        self.ft_sessions.pop(iid, None)
+                    self.root.after(0, lambda ii=iid: self._ft_set_conn_status(ii, "Disconnected"))
+                    self.root.after(0, lambda ii=iid: self._ft_log(f"[{ii}] Connect cancelled."))
+                    stopped_global = True
+                    break
+
+                if child and want_ping:
+                    okp, erp = sc.ping_open_device_shell(
+                        child, lg, 12.0, self.ft_connect_cancel_event
+                    )
+                    if not okp:
+                        self._ft_force_close_child(sc, child)
+                        with lock:
+                            self.ft_sessions.pop(iid, None)
+                        child = None
+                        err = erp or "ping failed"
+
+                if child:
+                    with lock:
                         self.ft_sessions[iid] = child
-                        self.root.after(0, lambda ii=iid: self._ft_set_conn_status(ii, "Connected"))
-                    else:
-                        self.ft_sessions[iid] = None
-                        self.root.after(0, lambda ii=iid: self._ft_set_conn_status(ii, "Error"))
-                        self.root.after(0, lambda er=err, ii=iid: self._ft_log(f"[{ii}] {er}"))
-            except Exception as e:
-                self.root.after(0, lambda er=str(e), ii=iid: self._ft_log(f"[{ii}] Connect exception: {er}"))
+                    self.root.after(0, lambda ii=iid: self._ft_set_conn_status(ii, "Connected"))
+                    ok_n += 1
+                    got_connected = True
+                    if pause_ok > 0:
+                        time.sleep(pause_ok)
+                    break
+
+                err_txt = err or "unknown error"
+                may_retry = (
+                    attempt < extra_retries
+                    and self._ft_is_transient_connect_error(err_txt)
+                    and not self.ft_connect_cancel_event.is_set()
+                )
+
+                if may_retry and remaining_cap > 0:
+                    self.root.after(
+                        0,
+                        lambda er=err_txt, ii=iid: self._ft_log(f"[{ii}] {er} (will retry)"),
+                    )
+                    sleep_t = min(backoff_base * (2**attempt), remaining_cap, 2.0)
+                    if sleep_t > 0:
+                        time.sleep(sleep_t)
+                        backoff_used += sleep_t
+                    with lock:
+                        self.ft_sessions.pop(iid, None)
+                    continue
+
+                self.root.after(0, lambda er=err_txt, ii=iid: self._ft_log(f"[{ii}] {er}"))
                 self.root.after(0, lambda ii=iid: self._ft_set_conn_status(ii, "Error"))
+                fail_n += 1
+                with lock:
+                    self.ft_sessions.pop(iid, None)
+                break
+
+            if stopped_global:
+                break
+
+        self.root.after(
+            0,
+            lambda on=ok_n, fn=fail_n, nt=n_total: self._ft_log(
+                f"Connect finished: succeeded={on}, failed={fn}, queued={nt}"
+            ),
+        )
 
     def _ft_log(self, msg: str) -> None:
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -2829,6 +3365,10 @@ Current Environment: {self.config.ENVIRONMENT_NAME}"""
             self._ft_load_csv(Path(p))
 
     def _ft_load_csv(self, path: Path) -> None:
+        if hasattr(self, "_ft_invalidate_insight_snapshot"):
+            self._ft_invalidate_insight_snapshot()
+        if hasattr(self, "ft_manual_rows"):
+            self.ft_manual_rows.clear()
         try:
             with path.open(newline="", encoding="utf-8-sig") as f:
                 reader = csv.DictReader(f)
@@ -2836,9 +3376,11 @@ Current Environment: {self.config.ENVIRONMENT_NAME}"""
                     messagebox.showerror("CSV", "CSV has no header row.")
                     return
                 fn = list(reader.fieldnames)
-                if "Name" not in fn or "SDM Port" not in fn:
-                    messagebox.showerror("CSV", "CSV must include columns 'Name' and 'SDM Port'.")
+                if "SDM Port" not in fn:
+                    messagebox.showerror("CSV", "CSV must include column 'SDM Port'.")
                     return
+                if "Name" not in fn:
+                    fn = ["Name"] + fn
                 rows = list(reader)
         except OSError as e:
             messagebox.showerror("CSV", str(e))
@@ -2858,22 +3400,26 @@ Current Environment: {self.config.ENVIRONMENT_NAME}"""
 
         for i, raw in enumerate(rows):
             raw_copy = dict(raw)
-            st = (raw_copy.get("SDM Status") or "").strip()
+            if "Name" not in raw_copy:
+                raw_copy["Name"] = ""
             port_ok = sc.is_valid_sdm_port(raw_copy.get("SDM Port") or "") is not None
-            eligible = st == "Enabled" and port_ok
-            self.ft_inventory.append({"iid": str(i), "raw": raw_copy, "eligible": eligible})
+            eligible = port_ok
+            self.ft_inventory.append(
+                {"iid": str(i), "raw": raw_copy, "eligible": eligible, "manual": False}
+            )
 
         for it in self.ft_tree.get_children():
             self.ft_tree.delete(it)
         for entry in self.ft_inventory:
             r = entry["raw"]
+            dn = self._ft_display_name(r)
             self.ft_tree.insert(
                 "",
                 tk.END,
                 iid=entry["iid"],
                 values=(
                     "☐",
-                    r.get("Name", "") or "",
+                    dn,
                     r.get("IP", "") or "",
                     r.get("Model", "") or "",
                     r.get("SDM Status", "") or "",
@@ -2883,19 +3429,126 @@ Current Environment: {self.config.ENVIRONMENT_NAME}"""
             )
 
         n_elig = sum(1 for e in self.ft_inventory if e["eligible"])
-        self.ft_csv_label_var.set(f"Loaded: {path.name} — rows={len(self.ft_inventory)}, eligible (Enabled + valid port)={n_elig}")
+        self.ft_csv_label_var.set(
+            f"Loaded: {path.name} — rows={len(self.ft_inventory)}, selectable (valid SDM port)={n_elig}"
+        )
         self._ft_update_summary()
-        self._ft_log(f"Loaded CSV {path} ({len(self.ft_inventory)} rows, {n_elig} eligible).")
+        self._ft_log(f"Loaded CSV {path} ({len(self.ft_inventory)} rows, {n_elig} selectable).")
         self._ft_sync_run_button_state()
+
+    def _ft_add_manual_port_clicked(self) -> None:
+        if getattr(self, "ft_csv_path", None):
+            messagebox.showwarning("Add port", "Clear CSV first to add manual AP rows.")
+            return
+        try:
+            sc = self._ft_import_sshcommand()
+        except Exception as exc:
+            messagebox.showerror("Add port", str(exc))
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("Add SDM port")
+        win.transient(self.root)
+        win.grab_set()
+
+        v_port = tk.StringVar()
+        v_name = tk.StringVar()
+        v_ip = tk.StringVar()
+        v_model = tk.StringVar()
+        v_status = tk.StringVar()
+
+        grid = ttk.Frame(win, padding=12)
+        grid.pack(fill=tk.BOTH, expand=True)
+        r = 0
+        ttk.Label(grid, text="SDM Port *").grid(row=r, column=0, sticky="w", pady=2)
+        ttk.Entry(grid, textvariable=v_port, width=18).grid(row=r, column=1, sticky="w", pady=2)
+        r += 1
+        ttk.Label(grid, text="Name").grid(row=r, column=0, sticky="w", pady=2)
+        ttk.Entry(grid, textvariable=v_name, width=40).grid(row=r, column=1, sticky="ew", pady=2)
+        r += 1
+        ttk.Label(grid, text="IP").grid(row=r, column=0, sticky="w", pady=2)
+        ttk.Entry(grid, textvariable=v_ip, width=40).grid(row=r, column=1, sticky="ew", pady=2)
+        r += 1
+        ttk.Label(grid, text="Model").grid(row=r, column=0, sticky="w", pady=2)
+        ttk.Entry(grid, textvariable=v_model, width=40).grid(row=r, column=1, sticky="ew", pady=2)
+        r += 1
+        ttk.Label(grid, text="SDM Status").grid(row=r, column=0, sticky="w", pady=2)
+        ttk.Entry(grid, textvariable=v_status, width=40).grid(row=r, column=1, sticky="ew", pady=2)
+        grid.columnconfigure(1, weight=1)
+
+        def on_ok() -> None:
+            port_raw = v_port.get().strip()
+            p = sc.is_valid_sdm_port(port_raw)
+            if p is None:
+                messagebox.showerror("Add port", "Enter a valid SDM Port (1–65535).", parent=win)
+                return
+            raw = {
+                "Name": v_name.get().strip(),
+                "SDM Port": str(p),
+                "SDM Status": v_status.get().strip() or "Manual",
+                "IP": v_ip.get().strip(),
+                "Model": v_model.get().strip(),
+            }
+            iid = str(uuid.uuid4())
+            self.ft_manual_rows.append({"iid": iid, "raw": raw})
+            if not getattr(self, "ft_csv_path", None):
+                self._ft_insert_manual_row_live(sc, iid, raw)
+            win.destroy()
+
+        def on_cancel() -> None:
+            win.destroy()
+
+        btn = ttk.Frame(win, padding=(12, 0, 12, 12))
+        btn.pack(fill=tk.X)
+        ttk.Button(btn, text="OK", command=on_ok).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(btn, text="Cancel", command=on_cancel).pack(side=tk.LEFT)
+
+    def _ft_remove_manual_port_clicked(self) -> None:
+        sel = self.ft_tree.selection()
+        if not sel:
+            messagebox.showwarning("Remove", "Select a row to remove.")
+            return
+        iid = sel[0]
+        ent = next((e for e in self.ft_inventory if e["iid"] == iid), None)
+        if not ent or not ent.get("manual"):
+            messagebox.showwarning("Remove", "Only manually added rows can be removed.")
+            return
+        try:
+            sc = self._ft_import_sshcommand()
+        except Exception:
+            sc = None
+        ch = None
+        lk = self._ft_lock_for(iid)
+        with lk:
+            ch = self.ft_sessions.pop(iid, None)
+        if ch is not None and sc is not None:
+            try:
+                sc.detach_device_shell(ch, 120.0, lambda _m: None)
+            except Exception:
+                try:
+                    ch.close(force=True)
+                except Exception:
+                    pass
+        elif ch is not None:
+            try:
+                ch.close(force=True)
+            except Exception:
+                pass
+        self.ft_manual_rows = [m for m in self.ft_manual_rows if m.get("iid") != iid]
+        self.ft_inventory = [e for e in self.ft_inventory if e["iid"] != iid]
+        self.ft_tree.delete(iid)
+        self._ft_update_inventory_status_message()
+        self._ft_on_tree_select()
 
     def _ft_toggle_row(self, event: tk.Event) -> None:
         row_id = self.ft_tree.identify_row(event.y)
         if not row_id:
             return
-        idx = int(row_id)
-        entry = self.ft_inventory[idx]
+        entry = next((e for e in self.ft_inventory if e["iid"] == row_id), None)
+        if entry is None:
+            return
         if not entry["eligible"]:
-            messagebox.showwarning("Selection", "Only rows with SDM Status=Enabled and a valid SDM Port can be selected.")
+            messagebox.showwarning("Selection", "Only rows with a valid SDM Port (1–65535) can be selected.")
             return
         vals = list(self.ft_tree.item(row_id)["values"])
         while len(vals) < 7:
@@ -2954,7 +3607,7 @@ Current Environment: {self.config.ENVIRONMENT_NAME}"""
         return sc.is_valid_sdm_port(rows[0].get("SDM Port") or "")
 
     def _ft_on_tree_select(self) -> None:
-        self.ft_sel_count_var.set(f"Selected eligible APs: {self._ft_count_selected_eligible()}")
+        self.ft_sel_count_var.set(f"Selected APs (valid port): {self._ft_count_selected_eligible()}")
         self._ft_update_selection_layout()
         self._ft_update_summary()
         self._ft_sync_run_button_state()
@@ -3010,7 +3663,7 @@ Current Environment: {self.config.ENVIRONMENT_NAME}"""
             self._ft_update_summary()
 
     def _ft_clear_form(self) -> None:
-        self.ft_url_var.set("")
+        self.ft_url_var.set(FT_DEFAULT_JUMP_SSH_URL)
         self.ft_rsa_var.set("")
         self.ft_ssh_port_var.set("443")
         self.ft_batch_ap_path_var.set("")
@@ -3024,25 +3677,6 @@ Current Environment: {self.config.ENVIRONMENT_NAME}"""
         self._ft_update_summary()
 
     def _ft_update_summary(self) -> None:
-        lines = []
-        lines.append(f"CSV: {self.ft_csv_path.name if self.ft_csv_path else '-'}")
-        lines.append(f"Selected APs: {self._ft_count_selected_eligible()}")
-        lines.append(f"Mode: {self.ft_mode_var.get()}")
-        if self.ft_mode_var.get() == "upload":
-            lines.append(f"Files queued: {len(self.ft_batch_upload_paths)}")
-            lines.append(f"AP dest: {self.ft_batch_ap_path_var.get().strip() or '-'}")
-        else:
-            nrp = len(self._ft_get_batch_remote_paths())
-            lines.append(f"Remote paths: {nrp} file(s)" if nrp else "Remote paths: -")
-            lines.append(f"Local folder: {self.ft_batch_local_dir_var.get().strip() or '-'}")
-            try:
-                lines.append(f"Download timeout: {int(self._ft_parse_download_timeout_sec())}s")
-            except ValueError:
-                lines.append("Download timeout: (invalid)")
-        self.ft_summary_text.config(state=tk.NORMAL)
-        self.ft_summary_text.delete(1.0, tk.END)
-        self.ft_summary_text.insert(tk.END, "\n".join(lines))
-        self.ft_summary_text.config(state=tk.DISABLED)
         mode = self.ft_mode_var.get()
         self.ft_run_btn.config(text="Upload" if mode == "upload" else "Download")
         self._ft_sync_run_button_state()
@@ -3059,6 +3693,8 @@ Current Environment: {self.config.ENVIRONMENT_NAME}"""
         self.ft_remote_refresh_btn.config(state=tk.DISABLED if busy else tk.NORMAL)
         if hasattr(self, "ft_stop_btn"):
             self.ft_stop_btn.config(state=tk.NORMAL if busy else tk.DISABLED)
+        if not busy:
+            self._ft_reset_download_progress()
         self._ft_sync_run_button_state()
 
     def _ft_ssh_settings_ok(self) -> bool:
@@ -3104,10 +3740,10 @@ Current Environment: {self.config.ENVIRONMENT_NAME}"""
             return
         rows = self._ft_get_selected_raw_rows()
         if not rows:
-            messagebox.showwarning("Transfer", "Select at least one eligible AP.")
+            messagebox.showwarning("Transfer", "Select at least one AP with a valid SDM port.")
             return
         if not self.ft_csv_fieldnames:
-            messagebox.showwarning("Transfer", "Load a CSV first.")
+            messagebox.showwarning("Transfer", "Load devices from Device Management or browse a CSV export.")
             return
 
         mode = self.ft_mode_var.get()
@@ -3185,8 +3821,9 @@ Current Environment: {self.config.ENVIRONMENT_NAME}"""
 
     def _ft_exec_batch_upload(self, csv_path: Path) -> None:
         sc, ssh_cmd = self._ft_build_ssh()
+        batch_pause = self._ft_parse_rel_seconds(self.ft_rel_pause_batch_var, 0.15, 0.0, 5.0)
         dest_base = self.ft_batch_ap_path_var.get().strip().rstrip("/")
-        uploads = []
+        uploads: List[Any] = []
         want_x = self.ft_upload_binary_var.get()
         for lp in self.ft_batch_upload_paths:
             spec = sc.parse_upload_arg(f"{lp}:{posixpath.join(dest_base, lp.name)}")
@@ -3198,60 +3835,101 @@ Current Environment: {self.config.ENVIRONMENT_NAME}"""
                 csv_path,
                 port_column="SDM Port",
                 name_column="Name",
-                require_sdm_enabled=True,
+                require_sdm_enabled=False,
             )
         )
         if not devices:
-            self.root.after(0, lambda: self._ft_log("No devices in temp CSV (check SDM Enabled + port)."))
+            self.root.after(0, lambda: self._ft_log("No devices in temp CSV (need a valid SDM Port per row)."))
             return
 
-        connect_t = 120.0
         cmd_t = 300.0
+        failures: List[str] = []
+        cancelled = False
+        attempted_any = False
+        all_ok = True
+
         for dev in devices:
-            tag = f"[{dev.name} port={dev.sdm_port}]"
-            iid = self._ft_iid_for_device(sc, dev.name, dev.sdm_port)
-            if not iid:
-                self.root.after(0, lambda t=tag: self._ft_log(f"{t} skipped (no table row)."))
-                continue
-
-            def make_log(t: str) -> Callable[[str], None]:
-                return lambda m: self.root.after(0, lambda mm=m, tt=t: self._ft_log(f"{tt} {mm}"))
-
-            lk = self._ft_lock_for(iid)
-            with lk:
-                ch = self.ft_sessions.get(iid)
-            if not ch:
-                self.root.after(0, lambda t=tag: self._ft_log(f"{t} Connect first (skipped)."))
-                continue
-            self._ft_begin_transfer_ops(iid, ch)
             try:
-                ok, det = sc.run_ops_on_open_shell(
-                    ch,
-                    uploads,
-                    [],
-                    [],
-                    cmd_t,
-                    make_log(tag),
-                    make_log(tag),
-                    cancel_event=self.ft_transfer_cancel_event,
-                )
+                if self.ft_transfer_cancel_event.is_set():
+                    cancelled = True
+                    break
+                tag = f"[{dev.name} port={dev.sdm_port}]"
+                iid = self._ft_iid_for_device(sc, dev.name, dev.sdm_port)
+                if not iid:
+                    failures.append(f"{tag} skipped (no table row).")
+                    all_ok = False
+                    continue
+
+                def make_log(t: str) -> Callable[[str], None]:
+                    return lambda m: self.root.after(0, lambda mm=m, tt=t: self._ft_log(f"{tt} {mm}"))
+
+                log_cb = make_log(tag)
+                ch = self._ft_ensure_batch_channel(sc, ssh_cmd, iid, tag, failures, log_cb)
+                if not ch:
+                    all_ok = False
+                    continue
+
+                for spec in uploads:
+                    if self.ft_transfer_cancel_event.is_set():
+                        cancelled = True
+                        break
+                    if not self._ft_shell_alive(ch):
+                        ch = self._ft_ensure_batch_channel(sc, ssh_cmd, iid, tag, failures, log_cb)
+                        if not ch:
+                            all_ok = False
+                            break
+                    attempted_any = True
+                    self._ft_begin_transfer_ops(iid, ch)
+                    try:
+                        ok, det = sc.run_ops_on_open_shell(
+                            ch,
+                            [spec],
+                            [],
+                            [],
+                            cmd_t,
+                            log_cb,
+                            log_cb,
+                            cancel_event=self.ft_transfer_cancel_event,
+                        )
+                    finally:
+                        self._ft_end_transfer_ops()
+                    if ok:
+                        self.root.after(
+                            0, lambda t=tag, n=spec.local_path.name: self._ft_log(f"{t} upload ok: {n}")
+                        )
+                    else:
+                        all_ok = False
+                        if det == "cancelled":
+                            cancelled = True
+                            break
+                        failures.append(f"{tag} upload {spec.local_path.name} -> {spec.device_path}: {det}")
+                    if getattr(ch, "closed", False):
+                        lk2 = self._ft_lock_for(iid)
+                        with lk2:
+                            if self.ft_sessions.get(iid) is ch:
+                                self.ft_sessions.pop(iid, None)
+                        self._ft_set_conn_status(iid, "Disconnected")
+                        failures.append(f"{tag} session closed; remaining files skipped for this AP.")
+                        break
+                if cancelled:
+                    break
             finally:
-                self._ft_end_transfer_ops()
-            if ok:
-                self.root.after(0, lambda t=tag: self._ft_log(f"{t} done."))
-            else:
-                self.root.after(0, lambda t=tag, d=det: self._ft_log(f"{t} FAILED: {d}"))
-            if getattr(ch, "closed", False):
-                lk2 = self._ft_lock_for(iid)
-                with lk2:
-                    if self.ft_sessions.get(iid) is ch:
-                        self.ft_sessions.pop(iid, None)
-                self._ft_set_conn_status(iid, "Disconnected")
-            if not ok and det == "cancelled":
-                break
+                if batch_pause > 0 and not self.ft_transfer_cancel_event.is_set():
+                    time.sleep(batch_pause)
+
+        def _finish() -> None:
+            if cancelled and not failures:
+                self._ft_log("Upload batch cancelled.")
+            elif not cancelled and attempted_any and all_ok and not failures:
+                messagebox.showinfo("Upload", "All files uploaded successfully for every AP.")
+            elif failures:
+                self._ft_show_failures_dialog("Upload failures", failures)
+
+        self.root.after(0, _finish)
 
     def _ft_exec_batch_download(self, csv_path: Path) -> None:
         sc, ssh_cmd = self._ft_build_ssh()
+        batch_pause = self._ft_parse_rel_seconds(self.ft_rel_pause_batch_var, 0.15, 0.0, 5.0)
         remote_paths = self._ft_get_batch_remote_paths()
         local_root = Path(self.ft_batch_local_dir_var.get().strip()).expanduser()
         devices = list(
@@ -3259,11 +3937,11 @@ Current Environment: {self.config.ENVIRONMENT_NAME}"""
                 csv_path,
                 port_column="SDM Port",
                 name_column="Name",
-                require_sdm_enabled=True,
+                require_sdm_enabled=False,
             )
         )
         if not devices:
-            self.root.after(0, lambda: self._ft_log("No devices in temp CSV."))
+            self.root.after(0, lambda: self._ft_log("No devices in temp CSV (need a valid SDM Port per row)."))
             return
 
         try:
@@ -3271,63 +3949,110 @@ Current Environment: {self.config.ENVIRONMENT_NAME}"""
         except ValueError:
             dl_sec = 900.0
 
-        connect_t = 120.0
         cmd_t = 300.0
+        failures: List[str] = []
+        cancelled = False
+        attempted_any = False
+        all_ok = True
+        total_ops = max(len(devices) * len(remote_paths), 1)
+        cur_done = 0
+
         for dev in devices:
-            tag = f"[{dev.name} port={dev.sdm_port}]"
-            iid = self._ft_iid_for_device(sc, dev.name, dev.sdm_port)
-            if not iid:
-                self.root.after(0, lambda t=tag: self._ft_log(f"{t} skipped (no table row)."))
-                continue
-            sub = local_root / self._ft_sanitize_dir_name(dev.name)
-            sub.mkdir(parents=True, exist_ok=True)
-            downloads = []
-            for remote_file in remote_paths:
-                base_name = posixpath.basename(remote_file) or "download"
-                local_path = sub / base_name
-                downloads.append(sc.parse_download_arg(f"{remote_file}:{local_path}"))
-
-            def make_log(t: str) -> Callable[[str], None]:
-                return lambda m: self.root.after(0, lambda mm=m, tt=t: self._ft_log(f"{tt} {mm}"))
-
-            lk = self._ft_lock_for(iid)
-            with lk:
-                ch = self.ft_sessions.get(iid)
-            if not ch:
-                self.root.after(0, lambda t=tag: self._ft_log(f"{t} Connect first (skipped)."))
-                continue
-            self._ft_begin_transfer_ops(iid, ch)
             try:
-                ok, det = sc.run_ops_on_open_shell(
-                    ch,
-                    [],
-                    [],
-                    downloads,
-                    cmd_t,
-                    make_log(tag),
-                    make_log(tag),
-                    download_timeout=dl_sec,
-                    cancel_event=self.ft_transfer_cancel_event,
-                )
+                if self.ft_transfer_cancel_event.is_set():
+                    cancelled = True
+                    break
+                tag = f"[{dev.name} port={dev.sdm_port}]"
+                iid = self._ft_iid_for_device(sc, dev.name, dev.sdm_port)
+                if not iid:
+                    failures.append(f"{tag} skipped (no table row).")
+                    all_ok = False
+                    continue
+                sub = local_root / self._ft_sanitize_dir_name(dev.name)
+                sub.mkdir(parents=True, exist_ok=True)
+
+                def make_log(t: str) -> Callable[[str], None]:
+                    return lambda m: self.root.after(0, lambda mm=m, tt=t: self._ft_log(f"{tt} {mm}"))
+
+                log_cb = make_log(tag)
+                ch = self._ft_ensure_batch_channel(sc, ssh_cmd, iid, tag, failures, log_cb)
+                if not ch:
+                    all_ok = False
+                    continue
+
+                for remote_file in remote_paths:
+                    if self.ft_transfer_cancel_event.is_set():
+                        cancelled = True
+                        break
+                    if not self._ft_shell_alive(ch):
+                        ch = self._ft_ensure_batch_channel(sc, ssh_cmd, iid, tag, failures, log_cb)
+                        if not ch:
+                            all_ok = False
+                            break
+                    base_name = posixpath.basename(remote_file) or "download"
+                    local_path = sub / base_name
+                    one_dl = [sc.parse_download_arg(f"{remote_file}:{local_path}")]
+                    cur_done += 1
+                    self._ft_set_download_progress(
+                        cur_done - 1,
+                        total_ops,
+                        f"{tag} {remote_file} ({cur_done}/{total_ops})",
+                    )
+                    attempted_any = True
+                    self._ft_begin_transfer_ops(iid, ch)
+                    try:
+                        ok, det = sc.run_ops_on_open_shell(
+                            ch,
+                            [],
+                            [],
+                            one_dl,
+                            cmd_t,
+                            log_cb,
+                            log_cb,
+                            download_timeout=dl_sec,
+                            cancel_event=self.ft_transfer_cancel_event,
+                        )
+                    finally:
+                        self._ft_end_transfer_ops()
+                    self._ft_set_download_progress(
+                        cur_done,
+                        total_ops,
+                        f"{tag} done {cur_done}/{total_ops}",
+                    )
+                    if ok:
+                        self.root.after(
+                            0,
+                            lambda t=tag, rp=remote_file, sd=sub: self._ft_log(f"{t} saved {rp} -> {sd}"),
+                        )
+                    else:
+                        all_ok = False
+                        if det == "cancelled":
+                            cancelled = True
+                            break
+                        failures.append(f"{tag} download {remote_file}: {det}")
+                    if getattr(ch, "closed", False):
+                        lk2 = self._ft_lock_for(iid)
+                        with lk2:
+                            if self.ft_sessions.get(iid) is ch:
+                                self.ft_sessions.pop(iid, None)
+                        self._ft_set_conn_status(iid, "Disconnected")
+                        failures.append(f"{tag} session closed; remaining downloads skipped for this AP.")
+                        break
+                if cancelled:
+                    break
             finally:
-                self._ft_end_transfer_ops()
-            if ok:
-                self.root.after(
-                    0,
-                    lambda t=tag, n=len(downloads), sd=sub: self._ft_log(
-                        f"{t} saved {n} file(s) under {sd}"
-                    ),
-                )
-            else:
-                self.root.after(0, lambda t=tag, d=det: self._ft_log(f"{t} FAILED: {d}"))
-            if getattr(ch, "closed", False):
-                lk2 = self._ft_lock_for(iid)
-                with lk2:
-                    if self.ft_sessions.get(iid) is ch:
-                        self.ft_sessions.pop(iid, None)
-                self._ft_set_conn_status(iid, "Disconnected")
-            if not ok and det == "cancelled":
-                break
+                if batch_pause > 0 and not self.ft_transfer_cancel_event.is_set():
+                    time.sleep(batch_pause)
+
+        def _finish() -> None:
+            if cancelled and not failures:
+                self._ft_log("Download batch cancelled.")
+            elif not cancelled and attempted_any and all_ok and not failures:
+                messagebox.showinfo("Download", "All files downloaded successfully for every AP.")
+            elif failures:
+                self._ft_show_failures_dialog("Download failures", failures)
+
+        self.root.after(0, _finish)
 
     def _ft_local_go(self) -> None:
         p = Path(self.ft_local_cwd_var.get().strip()).expanduser()
@@ -3491,7 +4216,7 @@ Current Environment: {self.config.ENVIRONMENT_NAME}"""
 
     def _ft_explorer_upload(self) -> None:
         if self._ft_count_selected_eligible() != 1:
-            messagebox.showwarning("Upload", "Select exactly one eligible AP.")
+            messagebox.showwarning("Upload", "Select exactly one AP with a valid SDM port.")
             return
         sels = self.ft_local_list.curselection()
         if not sels:
@@ -3522,14 +4247,8 @@ Current Environment: {self.config.ENVIRONMENT_NAME}"""
                 return
             sc, _ssh_cmd = self._ft_build_ssh()
             dest_base = self.ft_remote_cwd_var.get().strip().rstrip("/") or "/"
-            uploads = []
             want_x = self.ft_upload_binary_var.get()
-            for lp in paths:
-                spec = sc.parse_upload_arg(f"{lp}:{posixpath.join(dest_base, lp.name)}")
-                if want_x:
-                    spec = replace(spec, chmod_mode="+x")
-                uploads.append(spec)
-            tag = f"[{rows[0].get('Name','')}]"
+            tag = f"[{rows[0].get('Name', '')}]"
 
             def lg(m: str) -> None:
                 self.root.after(0, lambda mm=m, tt=tag: self._ft_log(f"{tt} {mm}"))
@@ -3540,35 +4259,61 @@ Current Environment: {self.config.ENVIRONMENT_NAME}"""
             if not ch:
                 self.root.after(0, lambda: self._ft_log("Upload: Connect first."))
                 return
-            self._ft_begin_transfer_ops(iid, ch)
-            try:
-                ok, det = sc.run_ops_on_open_shell(
-                    ch,
-                    uploads,
-                    [],
-                    [],
-                    300.0,
-                    lg,
-                    lg,
-                    cancel_event=self.ft_transfer_cancel_event,
-                )
-            finally:
-                self._ft_end_transfer_ops()
-            self.root.after(0, lambda tt=tag, ook=ok, ddet=det: self._ft_log(f"{tt} {'OK' if ook else 'FAILED: ' + str(ddet)}"))
-            if ok:
-                self.root.after(0, self._ft_refresh_remote_list)
-            if getattr(ch, "closed", False):
-                lk2 = self._ft_lock_for(iid)
-                with lk2:
-                    if self.ft_sessions.get(iid) is ch:
-                        self.ft_sessions.pop(iid, None)
-                self._ft_set_conn_status(iid, "Disconnected")
+
+            failures: List[str] = []
+            cancelled = False
+            all_ok = True
+            for lp in paths:
+                if self.ft_transfer_cancel_event.is_set():
+                    cancelled = True
+                    break
+                spec = sc.parse_upload_arg(f"{lp}:{posixpath.join(dest_base, lp.name)}")
+                if want_x:
+                    spec = replace(spec, chmod_mode="+x")
+                self._ft_begin_transfer_ops(iid, ch)
+                try:
+                    ok, det = sc.run_ops_on_open_shell(
+                        ch,
+                        [spec],
+                        [],
+                        [],
+                        300.0,
+                        lg,
+                        lg,
+                        cancel_event=self.ft_transfer_cancel_event,
+                    )
+                finally:
+                    self._ft_end_transfer_ops()
+                if not ok:
+                    all_ok = False
+                    if det == "cancelled":
+                        cancelled = True
+                        break
+                    failures.append(f"{tag} upload {spec.local_path.name} -> {spec.device_path}: {det}")
+                if getattr(ch, "closed", False):
+                    lk2 = self._ft_lock_for(iid)
+                    with lk2:
+                        if self.ft_sessions.get(iid) is ch:
+                            self.ft_sessions.pop(iid, None)
+                    self._ft_set_conn_status(iid, "Disconnected")
+                    failures.append(f"{tag} session closed; remaining uploads skipped.")
+                    break
+
+            def _done() -> None:
+                self._ft_log(f"{tag} {'OK' if (all_ok and not failures and not cancelled) else 'finished with issues'}")
+                if not cancelled and paths and all_ok and not failures:
+                    messagebox.showinfo("Upload", "All selected files uploaded successfully.")
+                    self._ft_refresh_remote_list()
+                elif failures:
+                    self._ft_show_failures_dialog("Upload failures", failures)
+
+            self.root.after(0, _done)
         finally:
             self.root.after(0, lambda: self._ft_set_busy(False))
 
     def _ft_explorer_download(self) -> None:
         if self._ft_count_selected_eligible() != 1:
-            messagebox.showwarning("Download", "Select exactly one eligible AP.")
+            messagebox.showwarning("Download", "Select exactly one AP with a valid SDM port.")
             return
         sels = self.ft_remote_list.curselection()
         if not sels:
@@ -3608,12 +4353,7 @@ Current Environment: {self.config.ENVIRONMENT_NAME}"""
                 return
             sc, _ssh_cmd = self._ft_build_ssh()
             base = self.ft_remote_cwd_var.get().strip().rstrip("/") or "/"
-            downloads = []
-            for n in names:
-                rpath = posixpath.join(base, n)
-                local_path = self.ft_local_cwd / n
-                downloads.append(sc.parse_download_arg(f"{rpath}:{local_path}"))
-            tag = f"[{rows[0].get('Name','')}]"
+            tag = f"[{rows[0].get('Name', '')}]"
 
             def lg(m: str) -> None:
                 self.root.after(0, lambda mm=m, tt=tag: self._ft_log(f"{tt} {mm}"))
@@ -3624,30 +4364,66 @@ Current Environment: {self.config.ENVIRONMENT_NAME}"""
             if not ch:
                 self.root.after(0, lambda: self._ft_log("Download: Connect first."))
                 return
-            self._ft_begin_transfer_ops(iid, ch)
-            try:
-                ok, det = sc.run_ops_on_open_shell(
-                    ch,
-                    [],
-                    [],
-                    downloads,
-                    300.0,
-                    lg,
-                    lg,
-                    download_timeout=dl_sec,
-                    cancel_event=self.ft_transfer_cancel_event,
+
+            failures: List[str] = []
+            cancelled = False
+            all_ok = True
+            total = max(len(names), 1)
+            cur = 0
+            for n in names:
+                if self.ft_transfer_cancel_event.is_set():
+                    cancelled = True
+                    break
+                rpath = posixpath.join(base, n)
+                local_path = self.ft_local_cwd / n
+                one_dl = [sc.parse_download_arg(f"{rpath}:{local_path}")]
+                cur += 1
+                self._ft_set_download_progress(
+                    cur - 1,
+                    total,
+                    f"{tag} {n} ({cur}/{total})",
                 )
-            finally:
-                self._ft_end_transfer_ops()
-            self.root.after(0, lambda tt=tag, ook=ok, ddet=det: self._ft_log(f"{tt} {'OK' if ook else 'FAILED: ' + str(ddet)}"))
-            if ok:
-                self.root.after(0, self._ft_refresh_local_list)
-            if getattr(ch, "closed", False):
-                lk2 = self._ft_lock_for(iid)
-                with lk2:
-                    if self.ft_sessions.get(iid) is ch:
-                        self.ft_sessions.pop(iid, None)
-                self._ft_set_conn_status(iid, "Disconnected")
+                self._ft_begin_transfer_ops(iid, ch)
+                try:
+                    ok, det = sc.run_ops_on_open_shell(
+                        ch,
+                        [],
+                        [],
+                        one_dl,
+                        300.0,
+                        lg,
+                        lg,
+                        download_timeout=dl_sec,
+                        cancel_event=self.ft_transfer_cancel_event,
+                    )
+                finally:
+                    self._ft_end_transfer_ops()
+                self._ft_set_download_progress(cur, total, f"{tag} done {cur}/{total}")
+                if not ok:
+                    all_ok = False
+                    if det == "cancelled":
+                        cancelled = True
+                        break
+                    failures.append(f"{tag} download {rpath}: {det}")
+                if getattr(ch, "closed", False):
+                    lk2 = self._ft_lock_for(iid)
+                    with lk2:
+                        if self.ft_sessions.get(iid) is ch:
+                            self.ft_sessions.pop(iid, None)
+                    self._ft_set_conn_status(iid, "Disconnected")
+                    failures.append(f"{tag} session closed; remaining downloads skipped.")
+                    break
+
+            def _done() -> None:
+                self._ft_log(f"{tag} {'OK' if (all_ok and not failures and not cancelled) else 'finished with issues'}")
+                if not cancelled and names and all_ok and not failures:
+                    messagebox.showinfo("Download", "All selected files downloaded successfully.")
+                elif failures:
+                    self._ft_show_failures_dialog("Download failures", failures)
+                if not cancelled and names:
+                    self._ft_refresh_local_list()
+
+            self.root.after(0, _done)
         finally:
             self.root.after(0, lambda: self._ft_set_busy(False))
 

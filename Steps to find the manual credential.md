@@ -1,16 +1,16 @@
-Steps to find the manual credentials:
+# Steps to find the manual credentials:
 
-1)Browse for insight url (Eg: https://pri-qa.insight.netgear.com)
+### 1)Browse for insight url (Eg: https://pri-qa.insight.netgear.com)
 
-2)Select the develop option -> Page Source
+### 2)Select the develop option -> Page Source
 
-3)In Local storage -> click the token and copy the value and paste it in the auth token field
+### 3)In Local storage -> click the token and copy the value and paste it in the auth token field
 
-4)In cookies -> take _id and paste it in user id field and account id and paste it in account id field
+### 4)In cookies -> take _id and paste it in user id field and account id and paste it in account id field
 
 
 
-***NOTE***
+# NOTE
 
 1)If the session got expired you need to copy and paste the token again.
 
